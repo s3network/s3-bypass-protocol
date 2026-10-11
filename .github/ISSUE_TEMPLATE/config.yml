@@ -3,7 +3,7 @@
 # this fork inherits are read-only upstream.
 contact_links:
   - name: S3 Bypass Desktop
-    url: https://github.com/thevladimirzh/s3-bypass-desktop
+    url: https://github.com/s3network/s3-bypass-desktop
     about: Desktop client for this engine — report client-side problems there.
   - name: Upstream engine
     url: https://github.com/Fedarisha/Xray-core-fedarisha

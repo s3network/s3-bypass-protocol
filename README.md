@@ -1,7 +1,7 @@
 # s3-bypass-protocol
 
 Our hardened build of the **fedarisha** tunnel engine — the transport behind
-[S3 Bypass Desktop](https://github.com/thevladimirzh/s3-bypass-desktop).
+[S3 Bypass Desktop](https://github.com/s3network/s3-bypass-desktop).
 
 Traffic is exchanged through an S3-compatible bucket: the client writes data as
 objects and reads the peer's objects back, while a small coordination server
@@ -52,7 +52,7 @@ sides.
 
 Assets use the upstream release names (`Xray-linux-64.zip`, `Xray-macos-64.zip`,
 `Xray-macos-arm64-v8a.zip`), so a consumer only has to change the download URL.
-Latest: [v0.1.0-fork.2](https://github.com/thevladimirzh/s3-bypass-protocol/releases).
+Latest: [v0.1.0-fork.4](https://github.com/s3network/s3-bypass-protocol/releases).
 
 ## Running our own server
 

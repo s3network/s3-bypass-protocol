@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-REPO_DEFAULT="https://github.com/thevladimirzh/s3-bypass-protocol"
+REPO_DEFAULT="https://github.com/s3network/s3-bypass-protocol"
 VERSION_DEFAULT="v0.1.0-fork.4"
 
 # Markers that must be present in the installed binary. The first proves it is

@@ -3,7 +3,7 @@
 ## Scope
 
 This repository is the tunnel engine. The desktop client lives in
-[thevladimirzh/s3-bypass-desktop](https://github.com/thevladimirzh/s3-bypass-desktop) —
+[s3network/s3-bypass-desktop](https://github.com/s3network/s3-bypass-desktop) —
 please report client-side problems there.
 
 In scope: the fedarisha protocol implementation, the transport code under

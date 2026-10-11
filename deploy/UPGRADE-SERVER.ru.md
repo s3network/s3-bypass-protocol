@@ -91,7 +91,7 @@ sudo ./deploy/upgrade-server.sh
 Скрипт требует существующий тег. Проверить:
 
 ```bash
-gh release view v0.1.0-fork.4 -R thevladimirzh/s3-bypass-protocol
+gh release view v0.1.0-fork.4 -R s3network/s3-bypass-protocol
 ```
 
 ---

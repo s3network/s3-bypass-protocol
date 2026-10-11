@@ -1,7 +1,7 @@
 # Развёртывание fedarisha-сервера на VPS
 
 Инструкция для нашего форка движка туннеля
-([репозиторий](https://github.com/thevladimirzh/s3-bypass-protocol)).
+([репозиторий](https://github.com/s3network/s3-bypass-protocol)).
 Сервер — это «мозг» туннеля: он принимает сессии, а трафик идёт напрямую
 между клиентом и S3-хранилищем. Поэтому сервер stateless и не хранит данных
 пользователей.
@@ -38,7 +38,7 @@
 VERSION=v0.1.0-fork.3
 SHA256=72c6005321446cc1ab4fe60f85e20576bfe8907ed36fdbc53e272868b94454e1
 
-curl -fLO "https://github.com/thevladimirzh/s3-bypass-protocol/releases/download/${VERSION}/Xray-linux-64.zip"
+curl -fLO "https://github.com/s3network/s3-bypass-protocol/releases/download/${VERSION}/Xray-linux-64.zip"
 echo "${SHA256}  Xray-linux-64.zip" | sha256sum -c -   # должен пройти
 ```
 
@@ -47,7 +47,7 @@ echo "${SHA256}  Xray-linux-64.zip" | sha256sum -c -   # должен пройт
 Дальше установщик из репозитория:
 
 ```bash
-git clone https://github.com/thevladimirzh/s3-bypass-protocol.git
+git clone https://github.com/s3network/s3-bypass-protocol.git
 cd s3-bypass-protocol
 VERSION=v0.1.0-fork.3 SHA256=72c6005321446cc1ab4fe60f85e20576bfe8907ed36fdbc53e272868b94454e1 \
   sudo -E ./deploy/install-server.sh

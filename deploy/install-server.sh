@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-REPO="${REPO:-https://github.com/thevladimirzh/s3-bypass-protocol}"
+REPO="${REPO:-https://github.com/s3network/s3-bypass-protocol}"
 VERSION="${VERSION:?set VERSION to a release tag, e.g. VERSION=v0.1.0-fork.1}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/s3bypass-protocol}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/s3bypass-protocol}"
