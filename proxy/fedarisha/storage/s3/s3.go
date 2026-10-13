@@ -96,8 +96,8 @@ func New(cfg Config) *S3Store {
 	// DELETEs of consumed files; write pool is dedicated to the PUT workers.
 	return &S3Store{
 		cfg:         cfg,
-		readClient:  newClient(newHTTPClient(96)),
-		writeClient: newClient(newHTTPClient(48)),
+		readClient:  newClient(newHTTPClient(192)),
+		writeClient: newClient(newHTTPClient(192)),
 	}
 }
 

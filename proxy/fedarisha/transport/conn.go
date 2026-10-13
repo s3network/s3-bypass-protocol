@@ -375,13 +375,18 @@ const (
 	// (beta observation 2026-10-09: get_errs 39-45, put_errs 0, ~4 min outage).
 	// 16 keeps every multiplexed stream fed while leaving the pool — and the
 	// headroom for List calls — free of a self-inflicted stampede.
+	//
+	// Deliberately left at 16. robustness_spec_test.go enforces <= 24 because
+	// 48 in-flight GETs is what drove the tail latency in the 2026-10-09
+	// outage, and the measured read-side burst is not the binding constraint
+	// here — the write side is.
 	maxReadConcurrency = 16
 
-	// readPoolConnections mirrors the read pool the S3 backend opens (96 in
+	// readPoolConnections mirrors the read pool the S3 backend opens (192 in
 	// storage/s3). The read-concurrency cap must stay comfortably below it so a
 	// fetch round cannot saturate the pool the DELETEs of consumed files also
 	// need.
-	readPoolConnections = 96
+	readPoolConnections = 192
 
 	// maxWriteConcurrency caps concurrent PUTs a single connection may have in
 	// flight, taken per request rather than per hedged file.
@@ -394,13 +399,18 @@ const (
 	// every PUT" exactly when the pool is under pressure.
 	//
 	// It mirrors readSem, which exists for the same reason on the read side.
-	// 16 leaves three connections' worth of the 48-connection pool for other
-	// sessions before anything queues.
-	maxWriteConcurrency = 16
+	//
+	// 2026-10-13: measured at 16 — peak concurrent PUTs reached 14 and a single
+	// PUT sustained a median 4.7 MB/s, so the cap was what limited throughput.
+	// Raised to 32 alongside writePoolConnections (192). The two must move
+	// together: per-session caps multiply by the number of live sessions, so a
+	// 16→32 bump alone would put 7 sessions at 224 PUTs against a 48-connection
+	// pool — the exact stampede documented above.
+	maxWriteConcurrency = 32
 
-	// writePoolConnections mirrors the write pool the S3 backend opens (48 in
+	// writePoolConnections mirrors the write pool the S3 backend opens (192 in
 	// storage/s3).
-	writePoolConnections = 48
+	writePoolConnections = 192
 )
 
 // holeTimeout bounds how long a missing readSeq file (with later files already
