@@ -16,8 +16,8 @@
 #
 # Usage:
 #   sudo ./deploy/upgrade-server.sh
-#   sudo ./deploy/upgrade-server.sh --version v0.1.0-fork.4
-#   sudo ./deploy/upgrade-server.sh --version v0.1.0-fork.4 --dry-run
+#   sudo ./deploy/upgrade-server.sh --version v0.1.0-fork.5
+#   sudo ./deploy/upgrade-server.sh --version v0.1.0-fork.5 --dry-run
 #   ./deploy/upgrade-server.sh --status
 #
 # Exits 0 only when the new binary is installed and the service is healthy.
@@ -26,7 +26,7 @@
 set -euo pipefail
 
 REPO_DEFAULT="https://github.com/s3network/s3-bypass-protocol"
-VERSION_DEFAULT="v0.1.0-fork.4"
+VERSION_DEFAULT="v0.1.0-fork.5"
 
 # Markers that must be present in the installed binary. The first proves it is
 # our fork at all; the rest are strings this release added and older ones do not
