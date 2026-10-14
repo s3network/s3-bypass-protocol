@@ -5,7 +5,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -197,7 +196,7 @@ func readConfDir(dirPath string) {
 			continue
 		}
 		if pattern.MatchString(f.Name()) {
-			configFiles.Set(path.Join(dirPath, f.Name()))
+			configFiles.Set(filepath.Join(dirPath, f.Name()))
 		}
 	}
 }
