@@ -45,9 +45,61 @@ func (c *Config) loadSelfCertPool() (*x509.CertPool, error) {
 	return root, nil
 }
 
+// certStore holds the live certificate list together with the mutex that
+// guards it.
+//
+// The hot-reload ticker started by setupOcspTicker replaces entries in this
+// slice from its own goroutine while TLS handshakes scan it. Passing the bare
+// slice to both sides meant the writer had no way to exclude the reader.
+type certStore struct {
+	mu    sync.Mutex
+	certs []*tls.Certificate
+}
+
+func (s *certStore) get(i int) *tls.Certificate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if i < 0 || i >= len(s.certs) {
+		return nil
+	}
+	return s.certs[i]
+}
+
+func (s *certStore) set(i int, cert *tls.Certificate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if i < 0 || i >= len(s.certs) {
+		return
+	}
+	s.certs[i] = cert
+}
+
+func (s *certStore) len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.certs)
+}
+
+// find returns the certificate matching sni or its wildcard form.
+func (s *certStore) find(sni, gsni string) *tls.Certificate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, keyPair := range s.certs {
+		if keyPair.Leaf.Subject.CommonName == sni || keyPair.Leaf.Subject.CommonName == gsni {
+			return keyPair
+		}
+		for _, name := range keyPair.Leaf.DNSNames {
+			if name == sni || name == gsni {
+				return keyPair
+			}
+		}
+	}
+	return nil
+}
+
 // BuildCertificates builds a list of TLS certificates from proto definition.
-func (c *Config) BuildCertificates() []*tls.Certificate {
-	certs := make([]*tls.Certificate, 0, len(c.Certificate))
+func (c *Config) BuildCertificates() *certStore {
+	store := &certStore{certs: make([]*tls.Certificate, 0, len(c.Certificate))}
 	for _, entry := range c.Certificate {
 		if entry.Usage != Certificate_ENCIPHERMENT {
 			continue
@@ -66,13 +118,16 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 			return &keyPair
 		}
 		if keyPair := getX509KeyPair(); keyPair != nil {
-			certs = append(certs, keyPair)
+			store.certs = append(store.certs, keyPair)
 		} else {
 			continue
 		}
-		index := len(certs) - 1
+		index := len(store.certs) - 1
 		setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
-			cert := certs[index]
+			cert := store.get(index)
+			if cert == nil {
+				return
+			}
 			if isReloaded {
 				if newKeyPair := getX509KeyPair(); newKeyPair != nil {
 					cert = newKeyPair
@@ -87,10 +142,10 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 					cert.OCSPStaple = newOCSPData
 				}
 			}
-			certs[index] = cert
+			store.set(index, cert)
 		})
 	}
-	return certs
+	return store
 }
 
 func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
@@ -243,33 +298,26 @@ func getGetCertificateFunc(c *tls.Config, ca []*Certificate) func(hello *tls.Cli
 	}
 }
 
-func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func getNewGetCertificateFunc(store *certStore, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		if len(certs) == 0 {
+		if store.len() == 0 {
 			return nil, errNoCertificates
 		}
 		sni := strings.ToLower(hello.ServerName)
-		if !rejectUnknownSNI && (len(certs) == 1 || sni == "") {
-			return certs[0], nil
+		if !rejectUnknownSNI && (store.len() == 1 || sni == "") {
+			return store.get(0), nil
 		}
 		gsni := "*"
 		if index := strings.IndexByte(sni, '.'); index != -1 {
 			gsni += sni[index:]
 		}
-		for _, keyPair := range certs {
-			if keyPair.Leaf.Subject.CommonName == sni || keyPair.Leaf.Subject.CommonName == gsni {
-				return keyPair, nil
-			}
-			for _, name := range keyPair.Leaf.DNSNames {
-				if name == sni || name == gsni {
-					return keyPair, nil
-				}
-			}
+		if cert := store.find(sni, gsni); cert != nil {
+			return cert, nil
 		}
 		if rejectUnknownSNI {
 			return nil, errNoCertificates
 		}
-		return certs[0], nil
+		return store.get(0), nil
 	}
 }
 
