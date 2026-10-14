@@ -52,7 +52,7 @@ sides.
 
 Assets use the upstream release names (`Xray-linux-64.zip`, `Xray-macos-64.zip`,
 `Xray-macos-arm64-v8a.zip`), so a consumer only has to change the download URL.
-Latest: [v0.1.0-fork.5](https://github.com/s3network/s3-bypass-protocol/releases).
+Latest: [v0.1.0-fork.6](https://github.com/s3network/s3-bypass-protocol/releases).
 
 ## Running our own server
 
