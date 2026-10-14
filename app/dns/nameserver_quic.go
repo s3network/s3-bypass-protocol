@@ -127,8 +127,10 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 				}
 				return
 			}
+			defer b.Release()
 
 			dnsReqBuf := buf.New()
+			defer dnsReqBuf.Release()
 			err = binary.Write(dnsReqBuf, binary.BigEndian, uint16(b.Len()))
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "binary write failed")
@@ -145,7 +147,6 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 				}
 				return
 			}
-			b.Release()
 
 			conn, err := s.openStream(dnsCtx)
 			if err != nil {
@@ -155,6 +156,13 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 				}
 				return
 			}
+
+			// context cancellation does not interrupt the blocking reads
+			// below, so arm a read deadline to keep this goroutine bounded
+			if err := conn.SetReadDeadline(deadline); err != nil {
+				errors.LogWarningInner(ctx, err, "failed to set read deadline")
+			}
+			defer conn.SetReadDeadline(time.Time{})
 
 			_, err = conn.Write(dnsReqBuf.Bytes())
 			if err != nil {
@@ -212,6 +220,19 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 // QueryIP implements Server.
 func (s *QUICNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {
 	return queryIP(ctx, s, domain, option)
+}
+
+// Close implements common.Closable.
+func (s *QUICNameServer) Close() error {
+	s.Lock()
+	conn := s.connection
+	s.connection = nil
+	s.Unlock()
+
+	if conn != nil {
+		_ = conn.CloseWithError(0, "")
+	}
+	return s.cacheController.Close()
 }
 
 func isActive(s *quic.Conn) bool {

@@ -87,6 +87,10 @@ type Handler struct {
 	// regexps               map[string]*regexp.Regexp       // or nil
 }
 
+// reverseOutboundWaitTimeout bounds how long a reverse inbound waits for the
+// first outbound handler to show up before it gives up.
+const reverseOutboundWaitTimeout = 10 * time.Second
+
 // New creates a new VLess inbound handler.
 func New(ctx context.Context, config *Config, dc dns.Client, validator vless.Validator) (*Handler, error) {
 	v := core.MustFromContext(ctx)
@@ -190,6 +194,26 @@ func isMuxAndNotXUDP(request *protocol.RequestHeader, first *buf.Buffer) bool {
 		firstBytes[6] == 2) // Network type: UDP
 }
 
+// waitForOutboundHandler waits until at least one outbound handler exists, so
+// that a reverse inbound does not become the default outbound. It gives up
+// instead of waiting forever when the config has no outbound at all, or when
+// the instance is shutting down.
+func (h *Handler) waitForOutboundHandler() error {
+	ctx, cancel := context.WithTimeout(h.ctx, reverseOutboundWaitTimeout)
+	defer cancel()
+
+	for {
+		if len(h.outboundHandlerManager.ListHandlers(h.ctx)) > 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errors.New("reverse: no outbound handler is available").Base(ctx.Err())
+		case <-time.After(time.Second):
+		}
+	}
+}
+
 func (h *Handler) GetReverse(a *vless.MemoryAccount) (*Reverse, error) {
 	u := h.validator.Get(a.ID.UUID())
 	if u == nil {
@@ -203,8 +227,8 @@ func (h *Handler) GetReverse(a *vless.MemoryAccount) (*Reverse, error) {
 	if r == nil {
 		picker, _ := reverse.NewStaticMuxPicker()
 		r = &Reverse{tag: a.Reverse.Tag, picker: picker, client: &mux.ClientManager{Picker: picker}}
-		for len(h.outboundHandlerManager.ListHandlers(h.ctx)) == 0 {
-			time.Sleep(time.Second) // prevents this outbound from becoming the default outbound
+		if err := h.waitForOutboundHandler(); err != nil {
+			return nil, err
 		}
 		if err := h.outboundHandlerManager.AddHandler(h.ctx, r); err != nil {
 			return nil, err
@@ -271,16 +295,19 @@ func (*Handler) Network() []net.Network {
 func (h *Handler) Process(ctx context.Context, network net.Network, connection stat.Connection, dispatch routing.Dispatcher) error {
 	iConn := stat.TryUnwrapStatsConn(connection)
 
+	sessionPolicy := h.policyManager.ForLevel(0)
+	// The read deadline has to be armed before the handshake: the handshake
+	// itself does several blocking reads and would otherwise be a slowloris
+	// target with no timeout at all.
+	if err := connection.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
+		return errors.New("unable to set read deadline").Base(err).AtWarning()
+	}
+
 	if h.decryption != nil {
 		var err error
 		if connection, err = h.decryption.Handshake(connection, nil); err != nil {
 			return errors.New("ML-KEM-768 handshake failed").Base(err).AtInfo()
 		}
-	}
-
-	sessionPolicy := h.policyManager.ForLevel(0)
-	if err := connection.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
-		return errors.New("unable to set read deadline").Base(err).AtWarning()
 	}
 
 	first := buf.FromBytes(make([]byte, buf.Size))
@@ -561,29 +588,37 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				fallthrough // we will break Mux connections that contain TCP requests
 			case protocol.RequestCommandTCP:
 				var t reflect.Type
-				var p uintptr
+				var p unsafe.Pointer
 				if commonConn, ok := connection.(*encryption.CommonConn); ok {
 					if _, ok := commonConn.Conn.(*encryption.XorConn); ok || !proxy.IsRAWTransportWithoutSecurity(iConn) {
 						inbound.CanSpliceCopy = 3 // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
 					}
 					t = reflect.TypeOf(commonConn).Elem()
-					p = uintptr(unsafe.Pointer(commonConn))
+					p = unsafe.Pointer(commonConn)
 				} else if tlsConn, ok := iConn.(*tls.Conn); ok {
 					if tlsConn.ConnectionState().Version != gotls.VersionTLS13 {
 						return errors.New(`failed to use `+requestAddons.Flow+`, found outer tls version `, tlsConn.ConnectionState().Version).AtWarning()
 					}
 					t = reflect.TypeOf(tlsConn.Conn).Elem()
-					p = uintptr(unsafe.Pointer(tlsConn.Conn))
+					p = unsafe.Pointer(tlsConn.Conn)
 				} else if realityConn, ok := iConn.(*reality.Conn); ok {
 					t = reflect.TypeOf(realityConn.Conn).Elem()
-					p = uintptr(unsafe.Pointer(realityConn.Conn))
+					p = unsafe.Pointer(realityConn.Conn)
 				} else {
 					return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
 				}
-				i, _ := t.FieldByName("input")
-				r, _ := t.FieldByName("rawInput")
-				input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
-				rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+				// Both fields must exist, otherwise the unsafe pointers below
+				// would silently alias the beginning of the connection struct.
+				i, ok := t.FieldByName("input")
+				if !ok {
+					return errors.New(`XTLS: field "input" not found in `, t.String()).AtWarning()
+				}
+				r, ok := t.FieldByName("rawInput")
+				if !ok {
+					return errors.New(`XTLS: field "rawInput" not found in `, t.String()).AtWarning()
+				}
+				input = (*bytes.Reader)(unsafe.Add(p, i.Offset))
+				rawInput = (*bytes.Buffer)(unsafe.Add(p, r.Offset))
 			}
 		} else {
 			return errors.New("account " + account.ID.String() + " is not able to use the flow " + requestAddons.Flow).AtWarning()

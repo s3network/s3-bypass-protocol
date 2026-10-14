@@ -43,11 +43,12 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	}
 
 	v := core.MustFromContext(ctx)
+	cone, _ := ctx.Value("cone").(bool)
 	s := &Server{
 		config:        config,
 		validator:     validator,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		cone:          ctx.Value("cone").(bool),
+		cone:          cone,
 	}
 
 	return s, nil

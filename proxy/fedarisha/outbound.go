@@ -37,6 +37,16 @@ func init() {
 	}))
 }
 
+// dialAttempt is one in-flight dial. Concurrent callers that arrive while a
+// dial is running wait on it and share its result instead of starting their
+// own: a backend that refuses handshakes then sees one attempt per round rather
+// than one per connection.
+type dialAttempt struct {
+	done    chan struct{}
+	session *yamux.Session
+	err     error
+}
+
 type Client struct {
 	ctx           context.Context
 	policyManager policy.Manager
@@ -45,6 +55,7 @@ type Client struct {
 
 	mu      sync.Mutex
 	session *yamux.Session
+	dial    *dialAttempt // non-nil while a dial is in flight
 }
 
 func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
@@ -185,15 +196,96 @@ func applyTuning(dialer *fedtransport.Dialer, tuning *TuningConfig) {
 	}
 }
 
+// dialTimeout bounds one complete dial — the hello upload plus the whole ACK
+// backoff schedule. It is a var so a test can shorten it.
+var dialTimeout = fedtransport.DialBudget()
+
+// getSession returns the shared yamux session, dialling one if there isn't a
+// live one already.
+//
+// Two properties matter here, and neither is optional:
+//
+//   - The mutex is NOT held across the network. Dial is a full handshake over
+//     S3 — a retried hello PUT followed by a backoff wait for the ACK — so
+//     holding c.mu across it froze every other caller behind one wedged store,
+//     not just the one doing the dialling.
+//   - A dial in flight is single-flight. Whoever arrives second waits for the
+//     first and reuses its result. Combined with the per-dial deadline below,
+//     a client whose backend has stopped accepting handshakes now returns an
+//     error and can fail over, instead of queueing behind an uploadRetrying
+//     loop whose context is the client's whole lifetime: that one never ended
+//     on its own, so a permanent S3 refusal left the outbound silently serving
+//     nothing, forever.
 func (c *Client) getSession() (*yamux.Session, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.session != nil && !c.session.IsClosed() {
-		return c.session, nil
+		s := c.session
+		c.mu.Unlock()
+		return s, nil
 	}
+	inflight := c.dial
+	c.mu.Unlock()
 
-	xconn, err := c.dialer.Dial(c.ctx)
+	if inflight != nil {
+		return c.awaitDial(inflight)
+	}
+	return c.startDial()
+}
+
+// startDial claims the dial slot and performs the handshake without the lock.
+// A caller that loses the race to install its own attempt waits on the winner.
+func (c *Client) startDial() (*yamux.Session, error) {
+	attempt := &dialAttempt{done: make(chan struct{})}
+
+	c.mu.Lock()
+	if c.session != nil && !c.session.IsClosed() {
+		s := c.session
+		c.mu.Unlock()
+		return s, nil
+	}
+	if c.dial != nil {
+		inflight := c.dial
+		c.mu.Unlock()
+		return c.awaitDial(inflight)
+	}
+	c.dial = attempt
+	c.mu.Unlock()
+
+	attempt.session, attempt.err = c.dialSession()
+
+	c.mu.Lock()
+	c.dial = nil
+	if attempt.err == nil {
+		c.session = attempt.session
+	}
+	c.mu.Unlock()
+	close(attempt.done)
+
+	return attempt.session, attempt.err
+}
+
+// awaitDial waits for someone else's dial and reports its result.
+func (c *Client) awaitDial(attempt *dialAttempt) (*yamux.Session, error) {
+	select {
+	case <-attempt.done:
+	case <-c.ctx.Done():
+		return nil, fmt.Errorf("fedarisha dial: %w", c.ctx.Err())
+	}
+	if attempt.err != nil {
+		return nil, attempt.err
+	}
+	if s := attempt.session; s != nil && !s.IsClosed() {
+		return s, nil
+	}
+	return nil, errors.New("fedarisha dial: the session that was dialled is already closed")
+}
+
+// dialSession runs one bounded handshake and wraps it in a yamux session.
+func (c *Client) dialSession() (*yamux.Session, error) {
+	ctx, cancel := context.WithTimeout(c.ctx, dialTimeout)
+	defer cancel()
+
+	xconn, err := c.dialer.Dial(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("fedarisha dial: %w", err)
 	}
@@ -203,8 +295,6 @@ func (c *Client) getSession() (*yamux.Session, error) {
 		xconn.Close()
 		return nil, fmt.Errorf("yamux client: %w", err)
 	}
-
-	c.session = session
 	return session, nil
 }
 

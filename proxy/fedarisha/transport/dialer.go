@@ -63,6 +63,23 @@ func ackRetryBudget() time.Duration {
 	return total
 }
 
+// dialSlack is what DialBudget adds on top of the ACK schedule: the hello
+// upload and its retries happen before the ACK wait begins, and a store slow
+// enough to miss the ACK schedule is usually slow on the hello too.
+const dialSlack = 30 * time.Second
+
+// DialBudget is the upper bound on one complete handshake: the hello upload
+// plus every ACK window.
+//
+// It exists because the caller's context is not a dial deadline. The outbound
+// passes the client's context — which lives as long as the client — and
+// uploadRetrying only exits on ctx.Err(), so a store that refused every hello
+// kept the outbound parked in one dial forever, with no error, no re-dial and
+// no traffic. Callers that have no deadline of their own must impose this one.
+func DialBudget() time.Duration {
+	return ackRetryBudget() + dialSlack
+}
+
 // waitForAck polls the ACK file for up to window. It returns the (possibly empty)
 // contents, or an error only if the caller's context was cancelled — a missing or
 // not-yet-complete ACK is a normal "keep waiting" outcome.

@@ -42,14 +42,23 @@ func (c *XmuxClient) maybeClose() {
 }
 
 type XmuxManager struct {
-	xmuxConfig  XmuxConfig
+	// xmuxConfig is a pointer on purpose: XmuxConfig is a protobuf message
+	// whose embedded MessageState carries a mutex, so copying it by value
+	// copies that lock.
+	xmuxConfig  *XmuxConfig
 	concurrency int32
 	connections int32
 	newConnFunc func() XmuxConn
 	xmuxClients []*XmuxClient
 }
 
-func NewXmuxManager(xmuxConfig XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
+// emptyXmuxConfig is the "no limits configured" case. It is shared read-only.
+var emptyXmuxConfig = &XmuxConfig{}
+
+func NewXmuxManager(xmuxConfig *XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
+	if xmuxConfig == nil {
+		xmuxConfig = emptyXmuxConfig
+	}
 	return &XmuxManager{
 		xmuxConfig:  xmuxConfig,
 		concurrency: xmuxConfig.GetNormalizedMaxConcurrency().rand(),

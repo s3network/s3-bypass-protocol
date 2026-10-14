@@ -10,18 +10,21 @@ var envReloadRegistry = struct {
 	handlers []func() error
 }{}
 
-// RegisterEnvReload registers an environment reload handler and runs it once
-// immediately so package defaults keep the same behavior as init-time reads.
+// RegisterEnvReload registers an environment reload handler.
+//
+// The handler is NOT run here: package init must not depend on the process
+// environment (it may still be incomplete at that point, and a bad value must
+// not abort the process with a bare panic). State is refreshed by
+// ReloadEnvSettings, which core.New calls after the configuration - including
+// its root "env" object - has been read, and which reports failures as a
+// regular error.
 func RegisterEnvReload(handler func() error) {
 	if handler == nil {
 		return
 	}
 	envReloadRegistry.Lock()
+	defer envReloadRegistry.Unlock()
 	envReloadRegistry.handlers = append(envReloadRegistry.handlers, handler)
-	envReloadRegistry.Unlock()
-	if err := handler(); err != nil {
-		panic(err)
-	}
 }
 
 // ReloadEnvSettings refreshes all registered environment-backed package state.

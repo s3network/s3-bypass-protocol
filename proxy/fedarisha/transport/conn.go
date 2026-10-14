@@ -413,6 +413,52 @@ const (
 	writePoolConnections = 192
 )
 
+// Read-side memory budgets.
+//
+// maxReadBatch above is a COUNT of files, not a size: 64 files of the default
+// 2MB is 128MB taken in by one connection in one poll, and nothing in the read
+// path pushes back — the buffer only drains when the application above reads.
+// So the round needs a byte ceiling of its own, and the buffer needs one too.
+// What a round fetched past the stopping point stays in prefetchCache and is
+// consumed next round; nothing is dropped.
+//
+// They are atomics for the same reason listTimeoutNanos is: the values are read
+// on the poll-loop goroutine, which the test that shortens them does not own, so
+// a plain var would be a data race. Zero means "use the default", exactly as
+// currentListTimeout treats its counter.
+const (
+	defaultRoundBytes        = 32 << 20
+	defaultReadBufBytes      = 32 << 20
+	defaultCleanupCallBudget = 10 * time.Second
+)
+
+var (
+	roundBytesBudget   atomic.Int64
+	readBufBytesBudget atomic.Int64
+	cleanupCallBudget  atomic.Int64
+)
+
+func roundBytes() int64 {
+	if v := roundBytesBudget.Load(); v > 0 {
+		return v
+	}
+	return defaultRoundBytes
+}
+
+func readBufBytes() int64 {
+	if v := readBufBytesBudget.Load(); v > 0 {
+		return v
+	}
+	return defaultReadBufBytes
+}
+
+func cleanupCallTimeout() time.Duration {
+	if v := cleanupCallBudget.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return defaultCleanupCallBudget
+}
+
 // holeTimeout bounds how long a missing readSeq file (with later files already
 // present) is tolerated before the session is treated as wedged and re-dialed.
 //
@@ -720,7 +766,29 @@ func encodePayload(data []byte) []byte {
 	return out
 }
 
-func decodePayload(data []byte) ([]byte, error) {
+// maxDecodedBytes bounds what one compressed frame may expand to.
+//
+// The writer compresses a chunk of at most maxFileSize, so a legitimate frame
+// decodes to no more than that. It is floored at DefaultMaxFileSize so a pair
+// configured with different maxFileSize values degrades to the default instead
+// of the reader cutting off its peer's legal chunks.
+func (c *Conn) maxDecodedBytes() int64 {
+	limit := c.maxFileSize
+	if limit < DefaultMaxFileSize {
+		limit = DefaultMaxFileSize
+	}
+	return int64(limit) + 1
+}
+
+// decodePayload reverses encodePayload.
+//
+// The compressed branch reads through a limit. It used to be a bare
+// io.ReadAll over a flate stream, so a small object from the bucket could
+// expand to whatever the encoder chose: a zip bomb, delivered as one ordinary
+// data file, allocating until the process died. Past the limit it reports an
+// error, which the caller already treats as a hole and the hole watchdog
+// escalates into a re-dial.
+func decodePayload(data []byte, maxDecoded int64) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, nil
 	}
@@ -728,7 +796,14 @@ func decodePayload(data []byte) ([]byte, error) {
 	case headerCompressed:
 		r := flate.NewReader(bytes.NewReader(data[1:]))
 		defer r.Close()
-		return io.ReadAll(r)
+		out, err := io.ReadAll(io.LimitReader(r, maxDecoded))
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(out)) > maxDecoded-1 {
+			return nil, fmt.Errorf("decompressed payload exceeds %d bytes", maxDecoded-1)
+		}
+		return out, nil
 	default:
 		return data[1:], nil
 	}
@@ -1178,13 +1253,16 @@ func (c *Conn) fetchNext() int {
 		c.noteListFailure(err)
 		return 0
 	}
-	present := make(map[uint64]struct{}, len(infos))
+	// present maps a sequence number to the size List reported for it. The size
+	// is what bounds the round: maxReadBatch is a COUNT of files, and 64 of the
+	// default 2MB is 128MB the reader had no reason to take in one go.
+	present := make(map[uint64]int64, len(infos))
 	for _, fi := range infos {
 		if fi.IsDir {
 			continue
 		}
 		if _, seq, ok := ParseSeqFileName(fi.Name); ok && seq >= c.readSeq {
-			present[seq] = struct{}{}
+			present[seq] = fi.Size
 		}
 	}
 
@@ -1208,7 +1286,7 @@ func (c *Conn) fetchNext() int {
 	// turns a List-lag stall — which otherwise persists into a hole-watchdog
 	// re-dial mid-speedtest — into an immediate fetch.
 	if _, ok := present[c.readSeq]; !ok && laterFiles {
-		present[c.readSeq] = struct{}{}
+		present[c.readSeq] = 0 // probed speculatively: size unknown
 	}
 
 	// Sequence numbers to fetch this round: present-and-not-cached, within a
@@ -1231,8 +1309,10 @@ func (c *Conn) fetchNext() int {
 	// cache while blocked on a hole — that just burns the read pool and keeps
 	// the missing file from landing.
 	fetching := 0
+	fetchedBytes := int64(0)
 	for seq := c.readSeq; seq < c.readSeq+maxReadBatch && fetching < maxReadBatch; seq++ {
-		if _, ok := present[seq]; !ok {
+		size, ok := present[seq]
+		if !ok {
 			continue // not written yet (a real hole) — skip, no 404
 		}
 		c.prefetchMu.Lock()
@@ -1242,7 +1322,16 @@ func (c *Conn) fetchNext() int {
 		}
 		c.prefetchMu.Unlock()
 
+		// The byte budget, checked BEFORE the file is fetched. Whatever has
+		// already been pulled this round counts against it; a file already
+		// cached does not, because it is in memory either way and this loop
+		// only decides what to go and get.
+		if fetching > 0 && fetchedBytes+size > roundBytes() {
+			break // the rest waits for the next round, when the buffer has drained
+		}
+
 		fetching++
+		fetchedBytes += size
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(seq uint64) {
@@ -1262,6 +1351,10 @@ func (c *Conn) fetchNext() int {
 	// (a genuine hole — the writer hasn't produced it yet) and resume there next
 	// poll. Files fetched past a hole stay cached.
 	consumed := 0
+	// backpressured records that the round stopped because the read buffer was
+	// already full, not because the peer stopped producing. The hole watchdog
+	// below must not mistake one for the other.
+	backpressured := false
 	for {
 		seq := c.readSeq
 		var data []byte
@@ -1289,15 +1382,33 @@ func (c *Conn) fetchNext() int {
 			log.Printf("[fedarisha:%s] decrypt error seq %d: %v", shortID(c.sessionID), seq, e)
 			break
 		}
-		payload, e := decodePayload(decrypted)
+		payload, e := decodePayload(decrypted, c.maxDecodedBytes())
 		if e != nil {
 			log.Printf("[fedarisha:%s] decode error: %v", shortID(c.sessionID), e)
 			break
 		}
 
+		// Backpressure: the buffer only drains when the application above
+		// reads, and the round is already holding the rest of this batch in
+		// prefetchCache. Appending regardless is how one slow consumer turned
+		// into 128MB of buffers on this connection — and on every other session
+		// multiplexed through it.
 		c.readMu.Lock()
-		c.readBuf.Write(payload)
+		full := int64(c.readBuf.Len())+int64(len(payload)) > readBufBytes()
+		if !full {
+			c.readBuf.Write(payload)
+		}
 		c.readMu.Unlock()
+		if full {
+			// Put the raw file back where the cache holds raw files, so the
+			// next round picks it up and decodes it again — decoding is a pure
+			// function of the file, so nothing is lost or double-counted.
+			c.prefetchMu.Lock()
+			c.prefetchCache[seq] = data
+			c.prefetchMu.Unlock()
+			backpressured = true
+			break
+		}
 		c.readCond.Broadcast()
 
 		c.lastRecvMu.Lock()
@@ -1329,6 +1440,10 @@ func (c *Conn) fetchNext() int {
 	if consumed > 0 {
 		log.Printf("[fedarisha:%s] fetchNext: got %d files (%d present), total %v", shortID(c.sessionID), consumed, len(present), time.Since(fetchStart))
 	}
+	if backpressured {
+		log.Printf("[fedarisha:%s] fetchNext: read buffer at its %d byte ceiling, holding the rest for the next round",
+			shortID(c.sessionID), readBufBytes())
+	}
 
 	// Hole watchdog: later files exist but we consumed nothing — readSeq is still
 	// missing even after the speculative head GET, so it's a genuine hole (not
@@ -1337,7 +1452,11 @@ func (c *Conn) fetchNext() int {
 	// under a second. If it persists past holeTimeout the peer is wedged on flow
 	// control and the file will never arrive — tear the session down so the
 	// outbound re-dials promptly instead of waiting for keepalive.
-	hole := laterFiles && consumed == 0
+	//
+	// A round that stopped on backpressure is not a hole: the data is sitting
+	// in readBuf waiting for a reader, and counting it as one would close a
+	// perfectly healthy session whenever the consumer fell behind.
+	hole := laterFiles && consumed == 0 && !backpressured
 	switch {
 	case !hole:
 		c.holeSince = time.Time{}
@@ -1518,6 +1637,17 @@ func (c *Conn) listForCleanup(ctx context.Context) ([]storage.FileInfo, error) {
 	return nil, lastErr
 }
 
+// cleanupSession removes everything this session left in the bucket.
+//
+// It is detached and best-effort, so every failure is counted and reported
+// rather than assigned to `_`: "the sweep finished" and "the sweep gave up
+// half-way" used to look identical in the log, which is how a session's objects
+// were never missed.
+//
+// Each DELETE gets its own budget (cleanupCallTimeout). The whole sweep used to
+// share the one context Close() hands it, so a backend that stopped answering
+// part-way through cut every remaining call short at the same moment and left
+// hundreds of objects behind with nothing but a DeadlineExceeded to show.
 func (c *Conn) cleanupSession(ctx context.Context) {
 	files, err := c.listForCleanup(ctx)
 	if err != nil {
@@ -1528,30 +1658,59 @@ func (c *Conn) cleanupSession(ctx context.Context) {
 			shortID(c.sessionID), c.sessDir, err)
 		return
 	}
+
+	remove := func(path string) bool {
+		callCtx, cancel := context.WithTimeout(ctx, cleanupCallTimeout())
+		defer cancel()
+		if err := c.store.Delete(callCtx, path); err != nil {
+			c.noteDeleteFailure(path, err)
+			return false
+		}
+		return true
+	}
+
+	failed := 0
 	if len(files) == 0 {
-		_ = c.store.Delete(ctx, c.sessDir)
-		return
-	}
-	paths := make([]string, 0, len(files))
-	for _, f := range files {
-		paths = append(paths, c.sessDir+"/"+f.Name)
-	}
-	if bd, ok := c.store.(batchDeleter); ok {
-		// S3 DeleteObjects accepts up to 1000 keys per call.
-		const chunkSize = 1000
-		for i := 0; i < len(paths); i += chunkSize {
-			end := i + chunkSize
-			if end > len(paths) {
-				end = len(paths)
-			}
-			_ = bd.BatchDelete(ctx, paths[i:end])
+		if !remove(c.sessDir) {
+			failed++
 		}
 	} else {
-		for _, p := range paths {
-			_ = c.store.Delete(ctx, p)
+		paths := make([]string, 0, len(files))
+		for _, f := range files {
+			paths = append(paths, c.sessDir+"/"+f.Name)
+		}
+		if bd, ok := c.store.(batchDeleter); ok {
+			// S3 DeleteObjects accepts up to 1000 keys per call.
+			const chunkSize = 1000
+			for i := 0; i < len(paths); i += chunkSize {
+				end := min(i+chunkSize, len(paths))
+				callCtx, cancel := context.WithTimeout(ctx, cleanupCallTimeout())
+				err := bd.BatchDelete(callCtx, paths[i:end])
+				cancel()
+				if err != nil {
+					// A batch failure reports the keys the backend refused, so
+					// count what is known lost and log the rest.
+					failed += end - i
+					log.Printf("[fedarisha:%s] cleanup: batch delete of %d object(s) under %s failed: %v",
+						shortID(c.sessionID), end-i, c.sessDir, err)
+				}
+			}
+		} else {
+			for _, p := range paths {
+				if !remove(p) {
+					failed++
+				}
+			}
+		}
+		if !remove(c.sessDir) {
+			failed++
 		}
 	}
-	_ = c.store.Delete(ctx, c.sessDir)
+
+	if failed > 0 {
+		log.Printf("[fedarisha:%s] cleanup: %d of %d object(s) under %s stay in the bucket",
+			shortID(c.sessionID), failed, len(files), c.sessDir)
+	}
 }
 
 // ---------- net.Addr ----------

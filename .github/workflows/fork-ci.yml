@@ -1,10 +1,10 @@
 name: Fork CI
 
-# Our own gate for the fedarisha changes. The inherited upstream workflows
-# exercise the whole Xray surface and depend on geodata assets that are not
-# vendored here, so they report failures unrelated to this fork. This workflow
-# covers what we actually changed, and it is strict: race detector, vet, and a
-# gofmt check.
+# Our own gate. The inherited upstream workflows exercise the whole Xray surface
+# and depend on things this repository does not carry, so they report failures
+# unrelated to this fork. This workflow covers the repository as it is: format,
+# build, vet over every package, race tests over every package, and the cross
+# builds.
 
 on:
   push:
@@ -13,8 +13,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  fedarisha:
-    name: fedarisha transport (race)
+  repository:
+    name: repository (build + vet + race)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -30,14 +30,37 @@ jobs:
         # rejects — which is how a spec slipped through and reddened the build.
         run: go run ./infra/vformat/main.go -mode check
 
-      - name: vet
-        run: go vet ./proxy/fedarisha/...
-
-      - name: test (race)
-        run: go test -race -count=1 -timeout 600s ./proxy/fedarisha/...
-
       - name: build
         run: go build ./...
+
+      - name: vet
+        # Whole repository, no exclusions: "go vet" also reports the findings of
+        # the packages it has to build, so a finding in a widely imported package
+        # has to redden the gate too.
+        run: go vet ./...
+
+      - name: test (race)
+        # Whole repository, not just the packages this fork touched: the race
+        # detector is only useful as a gate when nothing is excluded from it.
+        # The timeout is per package and leaves room for the transport and
+        # scenario tests that sleep.
+        run: go test -race -count=1 -timeout 1800s ./...
+
+  fedarisha:
+    name: fedarisha transport (race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+          check-latest: true
+
+      - name: test (race)
+        # The fast signal for the transport that got the most changes: the
+        # repository gate above needs far longer to produce a verdict.
+        run: go test -race -count=1 -timeout 600s ./proxy/fedarisha/...
 
   cross-build:
     name: build ${{ matrix.target }}

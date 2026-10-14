@@ -28,6 +28,7 @@ import (
 type Relay struct {
 	upstream string
 	frozen   atomic.Bool
+	stopped  atomic.Bool
 
 	mu    sync.Mutex
 	conns int
@@ -41,6 +42,13 @@ func (r *Relay) Frozen() bool { return r.frozen.Load() }
 // SetFrozen suspends or resumes relaying.
 func (r *Relay) SetFrozen(v bool) { r.frozen.Store(v) }
 
+// Stop ends the run: every copy loop leaves, including one parked in a freeze.
+//
+// A frozen copy spins in waitThawed; without this it keeps spinning after the
+// instrument has been told to stop, holding its sockets open and skewing every
+// number the soak that reads this log goes on to produce.
+func (r *Relay) Stop() { r.stopped.Store(true) }
+
 // Watch polls for the appearance and disappearance of a control file and flips
 // the freeze accordingly.
 //
@@ -49,6 +57,8 @@ func (r *Relay) SetFrozen(v bool) { r.frozen.Store(v) }
 // being used to measure. A missed notification here would silently invalidate
 // a run; a 50ms late one cannot.
 func (r *Relay) Watch(controlPath string, stop <-chan struct{}) {
+	defer r.Stop() // whatever ends the watch ends the relay with it
+
 	was := r.Frozen()
 	r.SetFrozen(fileExists(controlPath))
 	tick := time.NewTicker(50 * time.Millisecond)
@@ -86,6 +96,9 @@ func fileExists(path string) bool {
 func (r *Relay) copy(dst io.Writer, src io.Reader) {
 	buf := make([]byte, 32*1024)
 	for {
+		if r.stopped.Load() {
+			return
+		}
 		n, err := src.Read(buf)
 		if err != nil {
 			return
@@ -104,11 +117,18 @@ func (r *Relay) copy(dst io.Writer, src io.Reader) {
 
 // waitThawed blocks while frozen and reports whether relaying may continue.
 // A false return means the relay is shutting down.
+//
+// It checks the stop flag on every pass. The sleep is what made it deaf: a
+// frozen copy spun here for as long as the freeze lasted and past the end of
+// the run, holding both of the connection's copy goroutines and its sockets.
 func (r *Relay) waitThawed() bool {
 	for r.Frozen() {
+		if r.stopped.Load() {
+			return false
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return true
+	return !r.stopped.Load()
 }
 
 func (r *Relay) Serve(l net.Listener) error {
@@ -121,6 +141,32 @@ func (r *Relay) Serve(l net.Listener) error {
 	}
 }
 
+// closeWriter is implemented by *net.TCPConn: shutting down one direction only.
+// A full Close() here would tear down the copy that is still mid-stream.
+type closeWriter interface {
+	CloseWrite() error
+}
+
+// halfClose ends this direction and lets the peer see the EOF, which is how a
+// finished request/response is signalled without killing the other direction.
+func halfClose(c net.Conn) {
+	if cw, ok := c.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
+}
+
+// halfCloseGrace is how long the still-live direction is given after the other
+// one has ended and its half-close has been sent.
+const halfCloseGrace = 30 * time.Second
+
+// handle bridges one client connection to the upstream.
+//
+// Both copies are awaited and each one half-closes its direction when it ends.
+// The previous version returned on the FIRST copy, which is right for teardown
+// but wrong for the protocol: after the upstream finished sending, the client's
+// half-close never arrived, because the surviving goroutine kept reading from a
+// connection nobody was serving any more — and the relay logged the connection
+// closed while a goroutine still held it.
 func (r *Relay) handle(conn net.Conn) {
 	defer conn.Close()
 
@@ -138,9 +184,18 @@ func (r *Relay) handle(conn net.Conn) {
 	logEvent("conn #%d open (%s -> %s)", n, conn.RemoteAddr(), r.upstream)
 
 	done := make(chan struct{}, 2)
-	go func() { r.copy(up, conn); done <- struct{}{} }()
-	go func() { r.copy(conn, up); done <- struct{}{} }()
+	go func() { r.copy(up, conn); halfClose(up); done <- struct{}{} }()
+	go func() { r.copy(conn, up); halfClose(conn); done <- struct{}{} }()
 	<-done
+
+	// The other direction gets as long as a peer needs to see our half-close
+	// and answer it with its own. Past that it is not coming, and the deferred
+	// Close() tears both ends down.
+	select {
+	case <-done:
+	case <-time.After(halfCloseGrace):
+		logEvent("conn #%d: second direction did not finish within %v", n, halfCloseGrace)
+	}
 
 	r.mu.Lock()
 	r.conns--

@@ -3,7 +3,6 @@ package http
 import (
 	"context"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -73,11 +72,14 @@ func ParseHost(rawHost string, defaultPort net.Port) (net.Destination, error) {
 			return net.Destination{}, err
 		}
 	} else if len(rawPort) > 0 {
-		intPort, err := strconv.Atoi(rawPort)
+		// net.PortFromString rejects anything that does not fit in uint16, so an
+		// out-of-range port from a Host header is an error instead of a truncated
+		// port (70000 -> 4464, -1 -> 65535).
+		intPort, err := net.PortFromString(rawPort)
 		if err != nil {
 			return net.Destination{}, err
 		}
-		port = net.Port(intPort)
+		port = intPort
 	}
 
 	return net.TCPDestination(net.ParseAddress(host), port), nil

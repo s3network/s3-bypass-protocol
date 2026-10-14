@@ -5,6 +5,7 @@ package s3
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -142,7 +143,30 @@ func (s *S3Store) Download(ctx context.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 	defer out.Body.Close()
-	return io.ReadAll(out.Body)
+	// One object is one session file: data files are capped at the writer's
+	// maxFileSize and control files are 64 bytes, so nothing legitimate comes
+	// near this ceiling. Reading it unbounded meant one oversized object could
+	// be made to allocate as much memory as the backend cared to send.
+	return readLimited(out.Body, maxObjectBytes)
+}
+
+// maxObjectBytes is the hard ceiling on a single object this store will read.
+//
+// It is a backstop, not a policy: the writer already caps files at maxFileSize,
+// so this only fires for an object that is not a fedarisha file at all. A var so
+// a test can lower it rather than push 64MB through a loopback server.
+var maxObjectBytes = int64(64 << 20)
+
+// readLimited reads at most limit bytes and refuses anything longer.
+func readLimited(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("object exceeds the %d byte read limit", limit)
+	}
+	return data, nil
 }
 
 func (s *S3Store) List(ctx context.Context, dir string, prefix string) ([]storage.FileInfo, error) {
@@ -204,6 +228,13 @@ func (s *S3Store) List(ctx context.Context, dir string, prefix string) ([]storag
 		if !aws.ToBool(out.IsTruncated) {
 			break
 		}
+		// A truncated page with no continuation token: the next request would
+		// carry a nil token and return this same first page again, so the loop
+		// would never terminate. Some S3-compatible backends answer exactly
+		// like that at the end of a prefix — stop with what has been listed.
+		if out.NextContinuationToken == nil {
+			break
+		}
 		token = out.NextContinuationToken
 	}
 
@@ -253,9 +284,24 @@ func (s *S3Store) BatchDelete(ctx context.Context, paths []string) error {
 	for i, p := range paths {
 		objects[i] = s3types.ObjectIdentifier{Key: aws.String(s.key(p))}
 	}
-	_, err := s.readClient.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+	out, err := s.readClient.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Delete: &s3types.Delete{Objects: objects, Quiet: aws.Bool(true)},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	// Quiet suppresses the per-key SUCCESS elements, not the failures. A
+	// backend that answers 200 OK with errors in the body has still refused
+	// those keys; reporting success anyway is how a session's objects stayed in
+	// the bucket while teardown logged a clean sweep.
+	if len(out.Errors) == 0 {
+		return nil
+	}
+	refused := make([]string, 0, len(out.Errors))
+	for _, e := range out.Errors {
+		refused = append(refused, fmt.Sprintf("%s (%s: %s)",
+			aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message)))
+	}
+	return fmt.Errorf("%d of %d object(s) were NOT deleted: %s", len(refused), len(paths), strings.Join(refused, "; "))
 }

@@ -1,7 +1,6 @@
 package conf
 
 import (
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -770,15 +769,12 @@ func (c *XMC) Build() (proto.Message, error) {
 		return nil, fmt.Errorf("empty password")
 	}
 
-	rsaPrivateKey, err := xmc.DeriveRSAKey(c.Password)
+	keys, err := xmc.DeriveKeySet(c.Password)
 	if err != nil {
 		return nil, fmt.Errorf("derive minecraft rsa key: %w", err)
 	}
 
-	rsaPublicKey, err := x509.MarshalPKIXPublicKey(&rsaPrivateKey.PublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("marshal minecraft rsa public key: %w", err)
-	}
+	rsaPublicKey := keys.PublicKeyFor()
 
 	profiles := make([]*xmc.Profile, 0, len(c.Profiles))
 	for i := range c.Profiles {
@@ -792,7 +788,7 @@ func (c *XMC) Build() (proto.Message, error) {
 	return &xmc.Config{
 		Password:      c.Password,
 		Hostname:      c.Hostname,
-		RsaPrivateKey: x509.MarshalPKCS1PrivateKey(rsaPrivateKey),
+		RsaPrivateKey: keys.PackedPrivateKey(),
 		RsaPublicKey:  rsaPublicKey,
 		Profiles:      profiles,
 	}, nil

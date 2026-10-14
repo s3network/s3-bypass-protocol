@@ -1,7 +1,10 @@
 package conf
 
 import (
+	"math"
+
 	"github.com/xtls/xray-core/app/policy"
+	"github.com/xtls/xray-core/common/errors"
 )
 
 type Policy struct {
@@ -42,6 +45,9 @@ func (t *Policy) Build() (*policy.Policy, error) {
 	if t.BufferSize != nil {
 		bs := int32(-1)
 		if *t.BufferSize >= 0 {
+			if *t.BufferSize > math.MaxInt32/1024 {
+				return nil, errors.New("buffer size too large: ", *t.BufferSize, " KB")
+			}
 			bs = (*t.BufferSize) * 1024
 		}
 		p.Buffer = &policy.Policy_Buffer{

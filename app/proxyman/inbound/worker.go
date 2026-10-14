@@ -154,9 +154,10 @@ func (w *tcpWorker) Close() error {
 		if err := common.Close(w.hub); err != nil {
 			errs = append(errs, err)
 		}
-		if err := common.Close(w.proxy); err != nil {
-			errs = append(errs, err)
-		}
+	}
+	// the proxy must be closed even if Start() failed and left w.hub nil
+	if err := common.Close(w.proxy); err != nil {
+		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
 		return errors.New("failed to close all resources").Base(errors.New(serial.Concat(errs...)))
@@ -179,12 +180,12 @@ type udpConn struct {
 	done             *done.Instance
 	uplink           stats.Counter
 	downlink         stats.Counter
-	inactive         bool
+	inactive         atomic.Bool
 	cancel           context.CancelFunc
 }
 
 func (c *udpConn) setInactive() {
-	c.inactive = true
+	c.inactive.Store(true)
 }
 
 func (c *udpConn) updateActivity() {
@@ -331,7 +332,11 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 
 		go func() {
 			ctx, cancel := context.WithCancel(w.ctx)
+			// the cancel func is read under w.Lock() (by udpConn.Close()), so it
+			// has to be published under the same lock
+			w.Lock()
 			conn.cancel = cancel
+			w.Unlock()
 			sid := session.NewID()
 			ctx = c.ContextWithID(ctx, sid)
 
@@ -363,7 +368,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			}
 			conn.Close()
 			// conn not removed by checker TODO may be lock worker here is better
-			if !conn.inactive {
+			if !conn.inactive.Load() {
 				conn.setInactive()
 				w.removeConn(id)
 			}
@@ -395,7 +400,7 @@ func (w *udpWorker) clean() error {
 
 	for addr, conn := range w.activeConn {
 		if nowSec-atomic.LoadInt64(&conn.lastActivityTime) > 2*60 {
-			if !conn.inactive {
+			if !conn.inactive.Load() {
 				conn.setInactive()
 				delete(w.activeConn, addr)
 			}
@@ -446,6 +451,16 @@ func (w *udpWorker) Close() error {
 		if err := w.checker.Close(); err != nil {
 			errs = append(errs, err)
 		}
+	}
+
+	// abort the still running UDP sessions, otherwise their proxy.Process()
+	// goroutines would stay blocked on this worker's pipe after shutdown
+	for id, conn := range w.activeConn {
+		delete(w.activeConn, id)
+		if !conn.inactive.Load() {
+			conn.setInactive()
+		}
+		conn.Close()
 	}
 
 	if err := common.Close(w.proxy); err != nil {

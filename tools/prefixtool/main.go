@@ -86,7 +86,7 @@ func main() {
 	for _, p := range prefixes {
 		// Safety: never act outside the allowed root, and never on a prefix
 		// that could be a parent of live data.
-		if !strings.HasPrefix(p, *allowRoot) || p == *allowRoot || strings.Count(strings.TrimSuffix(p, "/"), "/") < strings.Count(strings.TrimSuffix(*allowRoot, "/"), "/") {
+		if !strictlyInside(p, *allowRoot) {
 			fail(fmt.Errorf("refusing prefix %q: it is not strictly inside %q", p, *allowRoot))
 		}
 	}
@@ -119,6 +119,45 @@ func main() {
 
 type storage struct {
 	bucket, endpoint, region, accessKey, secretKey string
+}
+
+// normalizePrefix strips the leading and trailing separators so that "a/b",
+// "a/b/" and "/a/b" are one and the same prefix. Every containment comparison
+// runs on these forms: comparing the raw strings made "fedarisha/b18-" and
+// "fedarisha/b18-/" look like different prefixes even though they name the
+// same place.
+func normalizePrefix(p string) string {
+	return strings.Trim(strings.TrimSpace(p), "/")
+}
+
+// strictlyInside reports whether p is strictly contained in root.
+//
+// It exists because the guard it replaced had a hole in exactly the place it
+// was written to protect. The old predicate was
+//
+//	!strings.HasPrefix(p, root) || p == root ||
+//	    count(trimSlash(p)) < count(trimSlash(root))
+//
+// and `-allow-root fedarisha/b18- -prefix fedarisha/b18-/` passed all three
+// terms: the prefix does start with the root, it is not textually equal to it,
+// and after trimming the trailing slash the depth count is 1 == 1. That
+// prefix is the parent of every live `b18-*/` directory, so `-delete` would
+// have reported "deleted" after removing all of them.
+//
+// The rule is therefore stated on the normalised forms and requires a strict
+// extension of the root — equality excluded, which is what closes the hole.
+// The old depth comparison is gone because strict extension already implies
+// it: any string that has the root as a proper prefix has at least as many
+// separators as the root, never fewer.
+func strictlyInside(p, root string) bool {
+	pn, rn := normalizePrefix(p), normalizePrefix(root)
+	if pn == "" {
+		return false // an empty prefix is the whole bucket
+	}
+	if pn == rn {
+		return false // the root itself, with or without a trailing slash
+	}
+	return strings.HasPrefix(pn, rn)
 }
 
 func loadStorage(path string) (storage, error) {
@@ -183,6 +222,13 @@ func listAll(ctx context.Context, c *s3.Client, bucket, prefix string) ([]string
 		if !aws.ToBool(out.IsTruncated) {
 			return keys, nil
 		}
+		// IsTruncated without a continuation token: re-issuing the request
+		// with a nil token returns the same first page forever, so the loop
+		// would never end. Some S3-compatible backends answer this way at the
+		// end of a large prefix; stop with what has been collected.
+		if out.NextContinuationToken == nil {
+			return keys, nil
+		}
 		token = out.NextContinuationToken
 	}
 }
@@ -203,27 +249,41 @@ func topLevelPrefixes(ctx context.Context, c *s3.Client, bucket string) ([]strin
 		if !aws.ToBool(res.IsTruncated) {
 			return out, nil
 		}
+		if res.NextContinuationToken == nil {
+			return out, nil
+		}
 		token = res.NextContinuationToken
 	}
 }
 
 func deleteAll(ctx context.Context, c *s3.Client, bucket string, keys []string) error {
 	const chunk = 1000 // DeleteObjects limit
+	var refused []string
 	for i := 0; i < len(keys); i += chunk {
-		end := i + chunk
-		if end > len(keys) {
-			end = len(keys)
-		}
+		end := min(i+chunk, len(keys))
 		ids := make([]types.ObjectIdentifier, 0, end-i)
 		for _, k := range keys[i:end] {
 			ids = append(ids, types.ObjectIdentifier{Key: aws.String(k)})
 		}
-		if _, err := c.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		out, err := c.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(bucket),
 			Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(true)},
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		}
+		// Quiet suppresses the per-key SUCCESS elements, not the failures. A
+		// backend that answers 200 OK with errors in the body has still
+		// refused those keys — reading only the status line and declaring the
+		// prefix deleted is how objects that survived a delete end up reported
+		// as gone.
+		for _, e := range out.Errors {
+			refused = append(refused, fmt.Sprintf("%s (%s: %s)",
+				aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message)))
+		}
+	}
+	if len(refused) > 0 {
+		return fmt.Errorf("%d of %d object(s) were NOT deleted: %s", len(refused), len(keys), strings.Join(refused, "; "))
 	}
 	return nil
 }

@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/subtle"
-	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -37,6 +36,7 @@ type serverConn struct {
 	profiles        []loginProfile
 	password        string
 	rsaPrivateKey   *rsa.PrivateKey
+	rsaFallbackKey  *rsa.PrivateKey
 	rsaPublicKey    []byte
 	paddingSchedule []paddingTurn
 	packet          *packetStream
@@ -186,7 +186,7 @@ func (c *serverConn) handshake() error {
 			return fmt.Errorf("read encrypt response: %w", err)
 		}
 
-		sharedSecret, err = rsa.DecryptPKCS1v15(rand.Reader, c.rsaPrivateKey, encryptedSharedSecret)
+		sharedSecret, err = c.decrypt(encryptedSharedSecret)
 		if err != nil {
 			return fmt.Errorf("decrypt shared secret: %w", err)
 		}
@@ -194,7 +194,7 @@ func (c *serverConn) handshake() error {
 			return fmt.Errorf("bad shared secret length: %d", len(sharedSecret))
 		}
 
-		decryptedVerifyToken, err = rsa.DecryptPKCS1v15(rand.Reader, c.rsaPrivateKey, encryptedVerifyToken)
+		decryptedVerifyToken, err = c.decrypt(encryptedVerifyToken)
 		if err != nil {
 			return fmt.Errorf("decrypt verify token: %w", err)
 		}
@@ -324,6 +324,21 @@ func (c *serverConn) SetReadDeadline(t time.Time) error {
 	return c.deadlines.setReadDeadline(t)
 }
 
+// decrypt tries the current key first and falls back to the legacy one, so a
+// client that has not been upgraded yet still completes the handshake.
+func (c *serverConn) decrypt(ciphertext []byte) ([]byte, error) {
+	out, err := rsa.DecryptPKCS1v15(rand.Reader, c.rsaPrivateKey, ciphertext)
+	if err == nil {
+		return out, nil
+	}
+	if c.rsaFallbackKey != nil {
+		if legacyOut, legacyErr := rsa.DecryptPKCS1v15(rand.Reader, c.rsaFallbackKey, ciphertext); legacyErr == nil {
+			return legacyOut, nil
+		}
+	}
+	return nil, err
+}
+
 func (c *serverConn) SetWriteDeadline(t time.Time) error {
 	return c.deadlines.setWriteDeadline(t)
 }
@@ -338,9 +353,9 @@ func wrapConnServer(c net.Conn, profiles []loginProfile, password string, rsaPri
 	if len(rsaPublicKey) == 0 {
 		return nil, fmt.Errorf("empty rsa public key")
 	}
-	rsaPrivateKey, err := x509.ParsePKCS1PrivateKey(rsaPrivateKeyDER)
+	keys, err := unpackKeySet(rsaPrivateKeyDER)
 	if err != nil {
-		return nil, fmt.Errorf("parse rsa private key: %w", err)
+		return nil, err
 	}
 	paddingSchedule, err := newServerPaddingSchedule2612()
 	if err != nil {
@@ -354,7 +369,8 @@ func wrapConnServer(c net.Conn, profiles []loginProfile, password string, rsaPri
 		state:           serverStateHandshake,
 		profiles:        profiles,
 		password:        password,
-		rsaPrivateKey:   rsaPrivateKey,
+		rsaPrivateKey:   keys.primary,
+		rsaFallbackKey:  keys.fallback,
 		rsaPublicKey:    rsaPublicKey,
 		paddingSchedule: paddingSchedule,
 		deadlines:       newConnectionDeadlines(c),

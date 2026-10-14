@@ -226,10 +226,40 @@ func (i *MultiUserInbound) Process(ctx context.Context, network net.Network, con
 	}
 }
 
+// userByIndex returns the user registered at the given index. The read is
+// serialized with AddUser/RemoveUser, which mutate the slice under the lock.
+func (i *MultiUserInbound) userByIndex(index int) *protocol.MemoryUser {
+	i.Lock()
+	defer i.Unlock()
+
+	if index < 0 || index >= len(i.users) {
+		return nil
+	}
+	return i.users[index]
+}
+
+// authenticatedUser resolves the user the service has already authenticated for
+// this connection. Without a user in the context there is nothing to attribute
+// the traffic to, so the connection is rejected instead of being charged to an
+// arbitrary user.
+func (i *MultiUserInbound) authenticatedUser(ctx context.Context) (*protocol.MemoryUser, error) {
+	userInt, ok := A.UserFromContext[int](ctx)
+	if !ok {
+		return nil, errors.New("user is not authenticated")
+	}
+	user := i.userByIndex(userInt)
+	if user == nil {
+		return nil, errors.New("user ", userInt, " is no longer registered")
+	}
+	return user, nil
+}
+
 func (i *MultiUserInbound) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
 	inbound := session.InboundFromContext(ctx)
-	userInt, _ := A.UserFromContext[int](ctx)
-	user := i.users[userInt]
+	user, err := i.authenticatedUser(ctx)
+	if err != nil {
+		return err
+	}
 	inbound.User = user
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 		From:   metadata.Source,
@@ -252,8 +282,10 @@ func (i *MultiUserInbound) NewConnection(ctx context.Context, conn net.Conn, met
 
 func (i *MultiUserInbound) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
 	inbound := session.InboundFromContext(ctx)
-	userInt, _ := A.UserFromContext[int](ctx)
-	user := i.users[userInt]
+	user, err := i.authenticatedUser(ctx)
+	if err != nil {
+		return err
+	}
 	inbound.User = user
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 		From:   metadata.Source,

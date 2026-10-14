@@ -14,6 +14,11 @@ type evalValue struct {
 	isBytes bool
 }
 
+// maxPadTarget caps the "pad" expression's target length. Header expressions
+// come from configuration, and an unbounded target lets a bad value allocate
+// until the process dies.
+const maxPadTarget = 1 << 22 // 4 MiB
+
 type evalContext struct {
 	vars     map[string][]byte
 	metadata map[string]evalValue
@@ -205,6 +210,12 @@ func evaluateExpr(expr *Expr, ctx *evalContext) (evalValue, error) {
 		if err != nil {
 			return evalValue{}, err
 		}
+		// offsetU64 and lengthU64 are attacker- or config-supplied. The sum
+		// can wrap around uint64, which would make the bound check below
+		// pass while the slice expression still panics.
+		if offsetU64 > uint64(len(sourceBytes)) || lengthU64 > uint64(len(sourceBytes)) {
+			return evalValue{}, errors.New("slice out of bounds")
+		}
 		end := offsetU64 + lengthU64
 		if end > uint64(len(sourceBytes)) {
 			return evalValue{}, errors.New("slice out of bounds")
@@ -343,11 +354,16 @@ func evaluatePad(args []*ExprArg, ctx *evalContext) (evalValue, error) {
 	if targetU64 < uint64(len(sourceBytes)) {
 		return evalValue{}, errors.New("pad target shorter than source")
 	}
+	// int(targetU64) is negative past MaxInt64, which would make
+	// remaining negative and turn the slice below into a panic.
+	if targetU64 > uint64(maxPadTarget) {
+		return evalValue{}, errors.New("pad target too large")
+	}
 
 	out := append([]byte(nil), sourceBytes...)
 	for uint64(len(out)) < targetU64 {
-		remaining := int(targetU64) - len(out)
-		if remaining >= len(fillBytes) {
+		remaining := targetU64 - uint64(len(out))
+		if remaining >= uint64(len(fillBytes)) {
 			out = append(out, fillBytes...)
 			continue
 		}

@@ -1,6 +1,7 @@
 package retry_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -92,5 +93,52 @@ func TestExponentialBackoff(t *testing.T) {
 	}
 	if v := int64(duration / time.Millisecond); v < 4000 {
 		t.Error("duration: ", v)
+	}
+}
+
+func TestRetryCancelledByContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	called := 0
+	err := ExponentialBackoff(10, 1000).OnWithContext(ctx, func() error {
+		called++
+		return errorTestOnly
+	})
+
+	if called != 0 {
+		t.Fatal("expected no attempt on an already cancelled context, got ", called)
+	}
+	if errors.Cause(err) != ErrRetryFailed {
+		t.Error("cause: ", err)
+	}
+}
+
+func TestRetryCancelledWhileWaiting(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startTime := time.Now()
+	called := 0
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+
+	// The backoff of this strategy is 10s, so only the cancellation can end it.
+	err := Timed(10, 10000).OnWithContext(ctx, func() error {
+		called++
+		return errorTestOnly
+	})
+	duration := time.Since(startTime)
+
+	if called != 1 {
+		t.Fatal("expected exactly one attempt, got ", called)
+	}
+	if errors.Cause(err) != ErrRetryFailed {
+		t.Error("cause: ", err)
+	}
+	if duration > 5*time.Second {
+		t.Fatal("cancellation did not interrupt the backoff, took ", duration)
 	}
 }

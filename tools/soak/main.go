@@ -24,11 +24,13 @@ package main
 //	go run ./tools/soak -logs client.log -report soak.json
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -73,6 +75,15 @@ func parseSize(v string) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("cannot read size %q: try 4MB", v)
 	}
+	// "-size -1" used to be accepted here and reached make([]byte, -1), which
+	// panics with "makeslice: len out of range" on the first transfer rather
+	// than at the flag that caused it.
+	if n < 0 {
+		return 0, fmt.Errorf("size %q must not be negative", v)
+	}
+	if n > 0 && mult > 1 && n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("size %q is too large", v)
+	}
 	return n * mult, nil
 }
 
@@ -98,6 +109,19 @@ func init() {
 
 func main() {
 	flag.Parse()
+
+	// time.NewTicker panics on a non-positive period, and both of these are
+	// typed by hand at 3am: -bucket 0 used to abort the whole run with a panic
+	// instead of one line saying which flag was wrong.
+	if *bucketWidth <= 0 {
+		fatalf("-bucket must be positive, got %v", *bucketWidth)
+	}
+	if *duration <= 0 {
+		fatalf("-duration must be positive, got %v", *duration)
+	}
+	if size <= 0 {
+		fatalf("-size must be positive, got %v", int64(size))
+	}
 
 	th := Thresholds{DownTTFB: *stallDown}
 	th.UpDuration = *stallUp
@@ -223,7 +247,7 @@ func main() {
 	end := time.Now()
 
 	s := summarize(all, start, end, th)
-	buckets := Bucketize(all, start, *bucketWidth, th)
+	buckets := Bucketize(all, start, *bucketWidth, th, end)
 
 	printSummary(s, buckets, *quiet)
 
@@ -232,8 +256,21 @@ func main() {
 	}
 }
 
+// countingReader remembers how many bytes were actually read out of it, which
+// is the only honest measure of what an upload put on the wire.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
 // doTransfer runs one request and measures the two things that matter: how long
-// the FIRST byte took, and how much actually arrived.
+// the FIRST byte took, and how much actually moved.
 func doTransfer(client *http.Client, worker int, dir string) Transfer {
 	t := Transfer{Worker: worker, Start: time.Now(), Dir: dir}
 
@@ -244,6 +281,10 @@ func doTransfer(client *http.Client, worker int, dir string) Transfer {
 
 	var req *http.Request
 	var err error
+	// sent counts the request body as the client hands it over, which for an
+	// upload is the only direction there is: the response to a POST is a couple
+	// of bytes.
+	var sent *countingReader
 
 	switch dir {
 	case "up":
@@ -254,7 +295,11 @@ func doTransfer(client *http.Client, worker int, dir string) Transfer {
 		if _, err = rand.Read(body); err != nil {
 			fatalf("cannot generate upload body: %v", err)
 		}
-		req, err = http.NewRequest(http.MethodPost, *upURL, strings.NewReader(string(body)))
+		// One copy, not three: the body is already []byte, so
+		// strings.NewReader(string(body)) allocated a second and a third copy
+		// of a buffer that can be tens of megabytes.
+		sent = &countingReader{r: bytes.NewReader(body)}
+		req, err = http.NewRequest(http.MethodPost, *upURL, sent)
 	case "down":
 		u := fmt.Sprintf("%s?bytes=%d", *downURL, int64(size))
 		req, err = http.NewRequest(http.MethodGet, u, nil)
@@ -270,14 +315,26 @@ func doTransfer(client *http.Client, worker int, dir string) Transfer {
 	if err != nil {
 		t.Err = err.Error()
 		t.Duration = time.Since(t.Start)
+		if sent != nil {
+			// An upload that failed part-way through still moved what it sent,
+			// and that volume is what the tunnel carried.
+			t.Bytes = sent.n
+		}
 		return t
 	}
 	defer resp.Body.Close()
 
-	n, _ := io.Copy(io.Discard, resp.Body)
+	received, copyErr := io.Copy(io.Discard, resp.Body)
 	finished := time.Now()
 
-	t.Bytes = n
+	// What the tunnel carried, per direction. Counting the response body for
+	// an upload reported the server's two-byte acknowledgement as the transfer,
+	// which halved every throughput figure the tool printed.
+	if sent != nil {
+		t.Bytes = sent.n
+	} else {
+		t.Bytes = received
+	}
 	t.Duration = finished.Sub(t.Start)
 	if !firstByte.IsZero() {
 		t.TTFB = firstByte.Sub(t.Start)
@@ -286,7 +343,13 @@ func doTransfer(client *http.Client, worker int, dir string) Transfer {
 		// empty transfer would report TTFB 0 and look impossibly fast.
 		t.TTFB = t.Duration
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	switch {
+	case copyErr != nil:
+		// A body that stopped arriving mid-stream is the exact symptom this
+		// tool exists to catch. It used to be discarded, and the transfer was
+		// recorded as a clean success with whatever had arrived so far.
+		t.Err = "read body: " + copyErr.Error()
+	case resp.StatusCode < 200 || resp.StatusCode >= 300:
 		t.Err = fmt.Sprintf("status %d", resp.StatusCode)
 	}
 	return t

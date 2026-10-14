@@ -138,8 +138,21 @@ func (c *clientConn) handshake() error {
 		return fmt.Errorf("read encryption request fields: %w", err)
 	}
 
+	// The public key is the negotiation point: an un-upgraded server derives
+	// its key with the legacy scheme, so before rejecting a mismatch we derive
+	// the legacy candidate from our own password and compare again.
 	if !bytes.Equal(publicKey, c.rsaPublicKey) {
-		return fmt.Errorf("server public key mismatch")
+		if !allowLegacyDerivation {
+			return fmt.Errorf("server public key mismatch")
+		}
+		legacy, legacyErr := DeriveRSAKey(c.password)
+		if legacyErr != nil {
+			return fmt.Errorf("server public key mismatch")
+		}
+		legacyDER, legacyErr := x509.MarshalPKIXPublicKey(&legacy.PublicKey)
+		if legacyErr != nil || !bytes.Equal(publicKey, legacyDER) {
+			return fmt.Errorf("server public key mismatch")
+		}
 	}
 
 	k, err := x509.ParsePKIXPublicKey(publicKey)

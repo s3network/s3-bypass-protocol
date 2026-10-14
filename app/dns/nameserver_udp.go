@@ -197,3 +197,28 @@ func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<
 func (s *ClassicNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {
 	return queryIP(ctx, s, domain, option)
 }
+
+// Close implements common.Closable.
+func (s *ClassicNameServer) Close() error {
+	var errs []error
+
+	if s.requestsCleanup != nil {
+		if err := s.requestsCleanup.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	s.Lock()
+	s.requests = make(map[uint16]*udpDnsRequest)
+	s.Unlock()
+
+	if s.udpServer != nil {
+		s.udpServer.RemoveRay()
+	}
+
+	if err := s.cacheController.Close(); err != nil {
+		errs = append(errs, err)
+	}
+
+	return errors.Combine(errs...)
+}

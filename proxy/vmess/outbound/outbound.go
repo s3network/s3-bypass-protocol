@@ -46,10 +46,11 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 	}
 
 	v := core.MustFromContext(ctx)
+	cone, _ := ctx.Value("cone").(bool)
 	handler := &Handler{
 		server:        server,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		cone:          ctx.Value("cone").(bool),
+		cone:          cone,
 	}
 
 	return handler, nil

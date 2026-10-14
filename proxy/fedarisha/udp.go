@@ -11,6 +11,12 @@ import (
 
 const targetHeaderUDPFlag uint16 = 0x8000
 
+// maxPacketMetaBytes bounds the destination block that precedes a packet's
+// payload. writePacketDestination emits one byte of network tag plus a
+// destination — at most a 255-byte domain and a port — so this is the ceiling
+// on what a well-formed frame can carry.
+const maxPacketMetaBytes = 512
+
 type fedarishaPacketWriter struct {
 	writer buf.Writer
 	dest   xraynet.Destination
@@ -27,6 +33,15 @@ func (w *fedarishaPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	defer buf.ReleaseMulti(mb)
 
 	frames := make(buf.MultiBuffer, 0, len(mb))
+	// Every frame built so far belongs to this writer until the writer is
+	// handed them. An error part-way through — or a writer that refuses the
+	// batch — used to drop up to 64 pooled buffers on the floor, where they are
+	// garbage collected outside the pool instead of going back to it.
+	defer func() {
+		if frames != nil {
+			buf.ReleaseMulti(frames)
+		}
+	}()
 	for _, payload := range mb {
 		if payload.IsEmpty() {
 			continue
@@ -56,9 +71,13 @@ func (w *fedarishaPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	}
 
 	if frames.IsEmpty() {
+		frames = nil
 		return nil
 	}
-	return w.writer.WriteMultiBuffer(frames)
+
+	out := frames
+	frames = nil // ownership passes to w.writer from here on
+	return w.writer.WriteMultiBuffer(out)
 }
 
 type fedarishaPacketReader struct {
@@ -80,6 +99,15 @@ func (r *fedarishaPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	}
 
 	metaLen := binary.BigEndian.Uint16(lenBuf[:])
+	// Bounded BEFORE reading, the way payloadLen is. The header word is
+	// attacker-controlled: at anything above buf.Size ReadFullFrom refuses
+	// without consuming a byte, so the length prefix of the payload is read as
+	// the first two bytes of the payload and the stream desynchronises from
+	// there on. Refusing up front is the same failure the oversized payload
+	// already produces, only deterministically.
+	if metaLen > maxPacketMetaBytes {
+		return nil, io.ErrUnexpectedEOF
+	}
 	var dest *xraynet.Destination
 	if metaLen > 0 {
 		meta := buf.New()

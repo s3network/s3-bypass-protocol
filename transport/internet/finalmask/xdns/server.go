@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -61,7 +62,9 @@ type xdnsConnServer struct {
 	readQueue     chan *packet
 	writeQueueMap map[string]*queue
 
-	closed bool
+	// closed is touched from Close() without holding mutex, while the read
+	// loops consult it while holding mutex. A plain bool is a data race.
+	closed atomic.Bool
 	mutex  sync.Mutex
 }
 
@@ -100,7 +103,7 @@ func (c *xdnsConnServer) clean() {
 		c.mutex.Lock()
 		defer c.mutex.Unlock()
 
-		if c.closed {
+		if c.closed.Load() {
 			return true
 		}
 
@@ -125,18 +128,46 @@ func (c *xdnsConnServer) clean() {
 	}
 }
 
+// maxWriteQueues bounds writeQueueMap. The key is the client address, and on
+// the server side that address is derived from an 8-byte clientID the sender
+// controls, so an off-path attacker can mint unlimited entries. Each entry
+// holds a 512-slot channel, so without a cap a flood of distinct IDs
+// exhausts memory before the idle sweep can catch up.
+const maxWriteQueues = 16384
+
 func (c *xdnsConnServer) ensureQueue(addr net.Addr) *queue {
-	if c.closed {
+	if c.closed.Load() {
 		return nil
 	}
 
-	q, ok := c.writeQueueMap[addr.String()]
+	key := addr.String()
+	q, ok := c.writeQueueMap[key]
 	if !ok {
+		if len(c.writeQueueMap) >= maxWriteQueues {
+			// Evict the entries that have gone idle. If none have, drop the
+			// whole table rather than let it grow without bound.
+			now := time.Now()
+			for k, v := range c.writeQueueMap {
+				if now.Sub(v.last) >= idleTimeout {
+					close(v.queue)
+					close(v.stash)
+					delete(c.writeQueueMap, k)
+				}
+			}
+			if len(c.writeQueueMap) >= maxWriteQueues {
+				for k, v := range c.writeQueueMap {
+					close(v.queue)
+					close(v.stash)
+					delete(c.writeQueueMap, k)
+				}
+				return nil
+			}
+		}
 		q = &queue{
 			queue: make(chan []byte, 512),
 			stash: make(chan []byte, 1),
 		}
-		c.writeQueueMap[addr.String()] = q
+		c.writeQueueMap[key] = q
 	}
 	q.last = time.Now()
 
@@ -147,7 +178,7 @@ func (c *xdnsConnServer) stash(queue *queue, p []byte) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	if c.closed {
+	if c.closed.Load() {
 		return
 	}
 
@@ -161,7 +192,7 @@ func (c *xdnsConnServer) recvLoop() {
 	var buf [finalmask.UDPSize]byte
 
 	for {
-		if c.closed {
+		if c.closed.Load() {
 			break
 		}
 
@@ -226,7 +257,7 @@ func (c *xdnsConnServer) recvLoop() {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	c.closed = true
+	c.closed.Store(true)
 	for key, q := range c.writeQueueMap {
 		close(q.queue)
 		close(q.stash)
@@ -326,13 +357,13 @@ func (c *xdnsConnServer) sendLoop() {
 			buf[2] |= 0x02
 		}
 
-		if c.closed {
+		if c.closed.Load() {
 			return
 		}
 
 		_, err = c.PacketConn.WriteTo(buf, rec.Addr)
 		if go_errors.Is(err, net.ErrClosed) {
-			c.closed = true
+			c.closed.Store(true)
 			break
 		}
 	}
@@ -381,7 +412,7 @@ func (c *xdnsConnServer) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 }
 
 func (c *xdnsConnServer) Close() error {
-	c.closed = true
+	c.closed.Store(true)
 	return c.PacketConn.Close()
 }
 

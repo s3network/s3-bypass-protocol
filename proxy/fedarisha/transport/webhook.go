@@ -28,6 +28,9 @@ type WebhookHub struct {
 	newSessions chan string // sends sessDir (e.g. "sessions/abc123")
 }
 
+// maxNotificationBytes caps one S3 notification body.
+const maxNotificationBytes = 1 << 20
+
 // NewWebhookHub creates a webhook hub.
 // prefix is the S3 key prefix (same as S3Store.Prefix).
 // webhookURL is the public URL of the webhook endpoint (used for subscription confirmation).
@@ -51,13 +54,17 @@ func (h *WebhookHub) Register(sessionID string) <-chan struct{} {
 	return ch
 }
 
-// Unregister removes and closes a session's notification channel.
+// Unregister removes a session's notification channel.
+//
+// It does NOT close it, and that is load-bearing. handleRecord used to read the
+// channel under RLock, drop the lock, and only then send on it — so a session
+// torn down in that window closed the channel underneath a live send and
+// panicked the process. Nothing waits for a close: the poll loop selects on
+// the connection's own closed/context channels, and a channel with no sender
+// left simply never fires. Dropping the map entry is enough to release it.
 func (h *WebhookHub) Unregister(sessionID string) {
 	h.mu.Lock()
-	if ch, ok := h.sessions[sessionID]; ok {
-		close(ch)
-		delete(h.sessions, sessionID)
-	}
+	delete(h.sessions, sessionID)
 	h.mu.Unlock()
 }
 
@@ -81,7 +88,10 @@ func (h *WebhookHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	// Bounded: the hub is mounted on a public URL, and a bare io.ReadAll lets a
+	// request that never stops sending decide how much memory this process
+	// holds. A notification naming the key it fired on is a few hundred bytes.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxNotificationBytes))
 	if err != nil {
 		http.Error(w, "read error", http.StatusBadRequest)
 		return
@@ -157,10 +167,14 @@ func (h *WebhookHub) handleRecord(rec s3Record) {
 	}
 
 	// Data file → wake up the session's poll loop.
+	//
+	// The read lock is held across the send. It is a non-blocking send into a
+	// buffered channel, so it cannot park; what it must not do is let go of the
+	// lock first, because that is what turned a routine session teardown into
+	// "send on closed channel" and took the whole process with it.
 	h.mu.RLock()
+	defer h.mu.RUnlock()
 	ch, ok := h.sessions[sessionID]
-	h.mu.RUnlock()
-
 	if ok {
 		select {
 		case ch <- struct{}{}:

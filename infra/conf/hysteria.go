@@ -20,6 +20,12 @@ func (c *HysteriaClientConfig) Build() (proto.Message, error) {
 	if c.Version != 2 {
 		return nil, errors.New("version != 2")
 	}
+	if c.Address == nil || c.Address.Address == nil {
+		return nil, errors.New("Hysteria server address is not set.")
+	}
+	if c.Port == 0 {
+		return nil, errors.New("Invalid Hysteria port.")
+	}
 
 	config := &hysteria.ClientConfig{}
 	config.Server = &protocol.ServerEndpoint{

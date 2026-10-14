@@ -5,6 +5,7 @@ import (
 	go_errors "errors"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -38,6 +39,7 @@ type CacheController struct {
 	cacheCleanup  *task.Periodic
 	highWatermark int
 	requestGroup  singleflight.Group
+	closed        atomic.Bool
 }
 
 func NewCacheController(name string, disableCache bool, serveStale bool, serveExpiredTTL uint32) *CacheController {
@@ -55,6 +57,18 @@ func NewCacheController(name string, disableCache bool, serveStale bool, serveEx
 		Execute:  c.CacheCleanup,
 	}
 	return c
+}
+
+// Close stops the background cache cleanup task. It is safe to call it more
+// than once, and must be called so that the timer does not outlive the
+// name server owning this controller.
+func (c *CacheController) Close() error {
+	c.closed.Store(true)
+
+	if c.cacheCleanup == nil {
+		return nil
+	}
+	return c.cacheCleanup.Close()
 }
 
 // CacheCleanup clears expired items from cache
@@ -303,7 +317,7 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 
 	errors.LogInfo(context.Background(), c.name, " got answer: ", req.domain, " ", req.reqType, " -> ", rep.IP, ", rtt: ", rtt, ", lock: ", lockWait)
 
-	if !c.serveStale || c.serveExpiredTTL != 0 {
+	if !c.closed.Load() && (!c.serveStale || c.serveExpiredTTL != 0) {
 		common.Must(c.cacheCleanup.Start())
 	}
 }

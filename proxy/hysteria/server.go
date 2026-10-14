@@ -129,7 +129,9 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 	} else {
 		sessionPolicy := s.policyManager.ForLevel(inbound.User.Level)
 
-		common.Must(conn.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)))
+		if err := conn.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
+			return errors.New("failed to set read deadline from: ", conn.RemoteAddr()).Base(err)
+		}
 		addr, err := ReadTCPRequest(conn)
 		if err != nil {
 			log.Record(&log.AccessMessage{
@@ -140,7 +142,9 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 			})
 			return errors.New("failed to create request from: ", conn.RemoteAddr()).Base(err)
 		}
-		common.Must(conn.SetReadDeadline(time.Time{}))
+		if err := conn.SetReadDeadline(time.Time{}); err != nil {
+			return errors.New("failed to clear read deadline from: ", conn.RemoteAddr()).Base(err)
+		}
 
 		dest, err := net.ParseDestination("tcp:" + addr)
 		if err != nil {

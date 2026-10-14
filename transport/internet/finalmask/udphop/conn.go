@@ -113,13 +113,17 @@ func (c *udpHopConn) hop(addr *net.UDPAddr) {
 			errors.LogErrorInner(context.Background(), err, "hop err")
 			return
 		}
-		switch c := raw.(type) {
+		switch conn := raw.(type) {
 		case *internet.PacketConnWrapper:
-			newConn = c.PacketConn
+			newConn = conn.PacketConn
 		case *cnc.Connection:
-			newConn = &internet.FakePacketConn{Conn: c}
+			newConn = &internet.FakePacketConn{Conn: conn}
 		default:
-			panic(reflect.TypeOf(c))
+			// The dial result type depends on sockopt and proxy
+			// configuration, so an unexpected type must not take the
+			// process down.
+			errors.LogError(context.Background(), "hop err unsupported conn type ", reflect.TypeOf(raw))
+			return
 		}
 		newConn.SetDeadline(c.deadline)
 		newConn.SetReadDeadline(c.readDeadline)

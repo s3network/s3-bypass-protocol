@@ -6,8 +6,10 @@ import (
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
+	goerrors "errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -26,11 +28,29 @@ type task struct {
 	StreamResponse bool   `json:"streamResponse"`
 }
 
+const (
+	// connsBufferSize is how many browser connections are kept around.
+	connsBufferSize = 256
+	// maxDialAttempts bounds how many dead browser connections a single dial
+	// may skip before giving up, so it can never spin forever.
+	maxDialAttempts = 8
+	// readHeaderTimeout protects the browser dialer http server against
+	// slowloris style connections that never finish sending headers.
+	readHeaderTimeout = 10 * time.Second
+)
+
+// dialerState is the whole mutable state of the browser dialer. Reload()
+// replaces it atomically, so a dial happening concurrently either uses the old
+// state or the new one, never a half initialized one.
+type dialerState struct {
+	addr   string
+	conns  chan *websocket.Conn
+	server *http.Server
+}
+
 var (
-	conns       chan *websocket.Conn
-	server      *http.Server
-	currentAddr string
-	mu          sync.Mutex
+	current atomic.Pointer[dialerState]
+	mu      sync.Mutex
 )
 
 var upgrader = &websocket.Upgrader{
@@ -45,63 +65,98 @@ var upgrader = &websocket.Upgrader{
 // Used by external projects when using xray as a go module
 func Reload() {
 	addr := platform.NewEnvFlag(platform.BrowserDialerAddress).GetValue(func() string { return "" })
+
 	mu.Lock()
 	defer mu.Unlock()
 
-	if addr == currentAddr && (addr == "" || server != nil) {
+	old := current.Load()
+	if old != nil && old.addr == addr {
+		return
+	}
+	if old != nil {
+		closeDialer(old)
+	}
+
+	if addr == "" {
+		current.Store(nil)
 		return
 	}
 
-	if server != nil {
-		server.Close()
-		server = nil
-	}
-	if HasBrowserDialer() {
-		for len(conns) > 0 {
-			select {
-			case c := <-conns:
-				c.Close()
-			default:
-			}
+	token := uuid.New()
+	csrfToken := token.String()
+	page := bytes.ReplaceAll(webpage, []byte("csrfToken"), []byte(csrfToken))
+
+	conns := make(chan *websocket.Conn, connsBufferSize)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/websocket" {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			_, _ = w.Write(page)
+			return
 		}
-		conns = nil
-	}
-	currentAddr = addr
-	if addr != "" {
-		token := uuid.New()
-		csrfToken := token.String()
-		webpage := bytes.ReplaceAll(webpage, []byte("csrfToken"), []byte(csrfToken))
-		conns = make(chan *websocket.Conn, 256)
-		server = &http.Server{
-			Addr: addr,
-			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/websocket" {
-					if r.URL.Query().Get("token") == csrfToken {
-						if conn, err := upgrader.Upgrade(w, r, nil); err == nil {
-							conns <- conn
-						} else {
-							errors.LogError(context.Background(), "Browser dialer http upgrade unexpected error")
-						}
-					}
-				} else {
-					w.Header().Set("Access-Control-Allow-Origin", "*")
-					w.Write(webpage)
-				}
-			}),
+		if r.URL.Query().Get("token") != csrfToken {
+			return
 		}
-		go server.ListenAndServe()
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			errors.LogErrorInner(r.Context(), err, "browser dialer websocket upgrade failed")
+			return
+		}
+		// Never block here: if no dialer is waiting for a connection, drop it
+		// instead of parking the http handler on a full buffer forever.
+		select {
+		case conns <- conn:
+		default:
+			conn.Close()
+		}
+	})
+
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+	}
+
+	current.Store(&dialerState{
+		addr:   addr,
+		conns:  conns,
+		server: server,
+	})
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !goerrors.Is(err, http.ErrServerClosed) {
+			errors.LogErrorInner(context.Background(), err, "browser dialer stopped listening on ", addr)
+		}
+	}()
+}
+
+// closeDialer stops the http server and closes every pooled browser connection.
+func closeDialer(s *dialerState) {
+	if s.server != nil {
+		_ = s.server.Close()
+	}
+	if s.conns == nil {
+		return
+	}
+	for {
+		select {
+		case c := <-s.conns:
+			c.Close()
+		default:
+			return
+		}
 	}
 }
 
 func HasBrowserDialer() bool {
-	return conns != nil
+	s := current.Load()
+	return s != nil && s.conns != nil
 }
 
 type webSocketExtra struct {
 	Protocol string `json:"protocol,omitempty"`
 }
 
-func DialWS(uri string, ed []byte) (*websocket.Conn, error) {
+func DialWS(ctx context.Context, uri string, ed []byte) (*websocket.Conn, error) {
 	task := task{
 		Method:         "WS",
 		URL:            uri,
@@ -112,7 +167,7 @@ func DialWS(uri string, ed []byte) (*websocket.Conn, error) {
 		Protocol: base64.RawURLEncoding.EncodeToString(ed),
 	}
 
-	return dialTask(task)
+	return dialTask(ctx, task)
 }
 
 type httpExtra struct {
@@ -149,7 +204,7 @@ func httpExtraFromHeadersAndCookies(headers http.Header, cookies []*http.Cookie)
 	return &extra
 }
 
-func DialGet(uri string, headers http.Header, cookies []*http.Cookie) (*websocket.Conn, error) {
+func DialGet(ctx context.Context, uri string, headers http.Header, cookies []*http.Cookie) (*websocket.Conn, error) {
 	task := task{
 		Method:         "GET",
 		URL:            uri,
@@ -157,14 +212,14 @@ func DialGet(uri string, headers http.Header, cookies []*http.Cookie) (*websocke
 		StreamResponse: true,
 	}
 
-	return dialTask(task)
+	return dialTask(ctx, task)
 }
 
-func DialPacket(method string, uri string, headers http.Header, cookies []*http.Cookie, payload []byte) error {
-	return dialWithBody(method, uri, headers, cookies, payload)
+func DialPacket(ctx context.Context, method string, uri string, headers http.Header, cookies []*http.Cookie, payload []byte) error {
+	return dialWithBody(ctx, method, uri, headers, cookies, payload)
 }
 
-func dialWithBody(method string, uri string, headers http.Header, cookies []*http.Cookie, payload []byte) error {
+func dialWithBody(ctx context.Context, method string, uri string, headers http.Header, cookies []*http.Cookie, payload []byte) error {
 	task := task{
 		Method:         method,
 		URL:            uri,
@@ -172,42 +227,55 @@ func dialWithBody(method string, uri string, headers http.Header, cookies []*htt
 		StreamResponse: false,
 	}
 
-	conn, err := dialTask(task)
+	conn, err := dialTask(ctx, task)
 	if err != nil {
 		return err
 	}
+	defer conn.Close()
 
-	err = conn.WriteMessage(websocket.BinaryMessage, payload)
-	if err != nil {
+	if err := conn.WriteMessage(websocket.BinaryMessage, payload); err != nil {
 		return err
 	}
 
-	err = CheckOK(conn)
-	if err != nil {
-		return err
-	}
-
-	conn.Close()
-	return nil
+	return CheckOK(conn)
 }
 
-func dialTask(task task) (*websocket.Conn, error) {
+func dialTask(ctx context.Context, task task) (*websocket.Conn, error) {
+	s := current.Load()
+	if s == nil || s.conns == nil {
+		return nil, errors.New("browser dialer is not enabled")
+	}
+
 	data, err := json.Marshal(task)
 	if err != nil {
 		return nil, err
 	}
 
 	var conn *websocket.Conn
-	for {
-		conn = <-conns
-		if conn.WriteMessage(websocket.TextMessage, data) != nil {
-			conn.Close()
-		} else {
-			break
+	for range maxDialAttempts {
+		// Waiting for a browser connection must never outlive the dial itself.
+		select {
+		case c, ok := <-s.conns:
+			if !ok {
+				return nil, errors.New("browser dialer is closed")
+			}
+			conn = c
+		case <-ctx.Done():
+			return nil, errors.New("failed to get a browser connection").Base(ctx.Err())
 		}
+
+		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			conn.Close()
+			conn = nil
+			continue
+		}
+		break
 	}
-	err = CheckOK(conn)
-	if err != nil {
+	if conn == nil {
+		return nil, errors.New("no usable browser connection")
+	}
+
+	if err := CheckOK(conn); err != nil {
 		return nil, err
 	}
 

@@ -126,6 +126,13 @@ func (c *realmConnServer) addSTUN(packet []byte) bool {
 }
 
 func (c *realmConnServer) addPunch(packet []byte, addr net.Addr) bool {
+	// The source address comes from the socket, but a non-UDP conn would
+	// make the unchecked assertion below panic on every inbound packet.
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return false
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for meta, ch := range c.events {
@@ -135,7 +142,7 @@ func (c *realmConnServer) addPunch(packet []byte, addr net.Addr) bool {
 		}
 		select {
 		case ch <- PunchPacketEvent{
-			Addr:   addr.(*net.UDPAddr).AddrPort(),
+			Addr:   udpAddr.AddrPort(),
 			Packet: punchPacket,
 		}:
 		default:

@@ -43,6 +43,7 @@ type WebhookNotifier struct {
 	seen          sync.Map
 	lastSweep     atomic.Int64
 	done          chan struct{}
+	access        sync.Mutex
 	wg            sync.WaitGroup
 	closeOnce     sync.Once
 }
@@ -93,13 +94,19 @@ func (h *WebhookNotifier) Fire(ctx routing.Context, outboundTag string) {
 		return
 	}
 
-	h.wg.Add(1)
+	// Register the goroutine while holding access, so that Close can never
+	// observe a closed done channel and call Wait() on a counter that is
+	// about to be incremented ("Add called concurrently with Wait").
+	h.access.Lock()
 	select {
 	case <-h.done:
-		h.wg.Done()
+		h.access.Unlock()
 		return
 	default:
 	}
+	h.wg.Add(1)
+	h.access.Unlock()
+
 	go func() {
 		defer h.wg.Done()
 		h.post(ev)
@@ -227,7 +234,9 @@ func (h *WebhookNotifier) maybeSweep(now time.Time, ttl time.Duration) {
 // Only need to call if the Notifier is really used, otherwise GC can clean it
 func (h *WebhookNotifier) Close() error {
 	h.closeOnce.Do(func() {
+		h.access.Lock()
 		close(h.done)
+		h.access.Unlock()
 	})
 	h.wg.Wait()
 	h.client.CloseIdleConnections()

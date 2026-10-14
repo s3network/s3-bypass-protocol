@@ -22,6 +22,19 @@ import (
 	"github.com/xtls/xray-core/main/commands/base"
 )
 
+const (
+	// exitCodeConfigError is returned when the configuration cannot be loaded or
+	// built. systemd is told not to restart the process on it.
+	exitCodeConfigError = 23
+	// exitCodeStartError is returned when a valid configuration fails to start.
+	exitCodeStartError = 1
+)
+
+// shutdownTimeout bounds how long the server may take to drain after a
+// termination signal before the process exits anyway. It is a variable only so
+// that tests can shorten it.
+var shutdownTimeout = 5 * time.Second
+
 var cmdRun = &base.Command{
 	UsageLine: "{{.Exec}} run [-c config.json] [-confdir dir]",
 	Short:     "Run Xray with config, the default command",
@@ -83,7 +96,7 @@ func executeRun(cmd *base.Command, args []string) {
 	if err != nil {
 		fmt.Println("Failed to start:", err)
 		// Configuration error. Exit with a special value to prevent systemd from restarting.
-		os.Exit(23)
+		os.Exit(exitCodeConfigError)
 	}
 
 	if *test {
@@ -93,18 +106,42 @@ func executeRun(cmd *base.Command, args []string) {
 
 	if err := server.Start(); err != nil {
 		fmt.Println("Failed to start:", err)
-		os.Exit(-1)
+		os.Exit(exitCodeStartError)
 	}
-	defer server.Close()
 
 	// Explicitly triggering GC to remove garbage from config loading.
 	runtime.GC()
 	debug.FreeOSMemory()
 
-	{
-		osSignals := make(chan os.Signal, 1)
-		signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM)
-		<-osSignals
+	osSignals := make(chan os.Signal, 2)
+	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(osSignals)
+
+	waitForShutdown(server, osSignals)
+}
+
+// waitForShutdown closes the server after the first termination signal, but
+// does not hang forever on it: a stuck connection must not keep the process
+// alive, and a second signal exits right away. osSignals has to be registered
+// with signal.Notify by the caller.
+func waitForShutdown(server core.Server, osSignals <-chan os.Signal) {
+	<-osSignals
+
+	closed := make(chan struct{})
+	go func() {
+		server.Close()
+		close(closed)
+	}()
+
+	timer := time.NewTimer(shutdownTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-closed:
+	case <-timer.C:
+		fmt.Println("Shutdown timed out after", shutdownTimeout, "- forcing exit.")
+	case <-osSignals:
+		fmt.Println("Received a second termination signal - forcing exit.")
 	}
 }
 
@@ -113,7 +150,7 @@ func dumpConfig() int {
 	if config, err := core.GetMergedConfig(files); err != nil {
 		fmt.Println(err)
 		time.Sleep(1 * time.Second)
-		return 23
+		return exitCodeConfigError
 	} else {
 		fmt.Print(config)
 	}
@@ -151,12 +188,15 @@ func readConfDir(dirPath string) {
 	if err != nil {
 		log.Fatalln(err)
 	}
+	pattern, err := regexp.Compile(getRegepxByFormat())
+	if err != nil {
+		log.Fatalln(err)
+	}
 	for _, f := range confs {
-		matched, err := regexp.MatchString(getRegepxByFormat(), f.Name())
-		if err != nil {
-			log.Fatalln(err)
+		if f.IsDir() {
+			continue
 		}
-		if matched {
+		if pattern.MatchString(f.Name()) {
 			configFiles.Set(path.Join(dirPath, f.Name()))
 		}
 	}

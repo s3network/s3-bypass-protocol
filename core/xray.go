@@ -44,6 +44,14 @@ func getFeature(allFeatures []features.Feature, t reflect.Type) features.Feature
 	return nil
 }
 
+// copyFeatures snapshots the feature list, so that it can be used without
+// holding resolveLock.
+func copyFeatures(allFeatures []features.Feature) []features.Feature {
+	featureList := make([]features.Feature, len(allFeatures))
+	copy(featureList, allFeatures)
+	return featureList
+}
+
 func (r *resolution) callbackResolution(allFeatures []features.Feature) error {
 	callback := reflect.ValueOf(r.callback)
 	var input []reflect.Value
@@ -85,13 +93,18 @@ type Instance struct {
 	pendingResolutions         []resolution
 	pendingOptionalResolutions []resolution
 	running                    bool
-	resolveLock                sync.Mutex
+	closed                     bool
+	resolveLock                sync.RWMutex
 
-	ctx context.Context
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // Instance state
 func (server *Instance) IsRunning() bool {
+	server.statusLock.Lock()
+	defer server.statusLock.Unlock()
+
 	return server.running
 }
 
@@ -165,10 +178,12 @@ func OptionalFeatures(ctx context.Context, callback interface{}) error {
 // The instance is not started at this point.
 // To ensure Xray instance works properly, the config must contain one Dispatcher, one InboundHandlerManager and one OutboundHandlerManager. Other features are optional.
 func New(config *Config) (*Instance, error) {
-	server := &Instance{ctx: context.Background()}
+	ctx, cancel := context.WithCancel(context.Background())
+	server := &Instance{ctx: ctx, cancel: cancel}
 
 	done, err := initInstanceWithConfig(config, server)
 	if done {
+		cancel()
 		return nil, err
 	}
 
@@ -176,10 +191,13 @@ func New(config *Config) (*Instance, error) {
 }
 
 func NewWithContext(ctx context.Context, config *Config) (*Instance, error) {
-	server := &Instance{ctx: ctx}
+	// the instance owns the cancelation of the context it hands to its features
+	ctx, cancel := context.WithCancel(ctx)
+	server := &Instance{ctx: ctx, cancel: cancel}
 
 	done, err := initInstanceWithConfig(config, server)
 	if done {
+		cancel()
 		return nil, err
 	}
 
@@ -262,10 +280,25 @@ func (s *Instance) Close() error {
 	s.statusLock.Lock()
 	defer s.statusLock.Unlock()
 
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+
+	// stop everything that is still running with the instance context before
+	// tearing the features down; closing twice is a no-op
+	if s.cancel != nil {
+		s.cancel()
+	}
+
 	s.running = false
 
+	s.resolveLock.RLock()
+	featureList := copyFeatures(s.features)
+	s.resolveLock.RUnlock()
+
 	var errs []interface{}
-	for _, f := range s.features {
+	for _, f := range featureList {
 		if err := f.Close(); err != nil {
 			errs = append(errs, err)
 		}
@@ -305,8 +338,9 @@ func (s *Instance) RequireFeatures(callback interface{}, optional bool) error {
 		}
 	}
 	if foundAll {
+		featureList := copyFeatures(s.features)
 		s.resolveLock.Unlock()
-		return r.callbackResolution(s.features)
+		return r.callbackResolution(featureList)
 	} else {
 		if optional {
 			s.pendingOptionalResolutions = append(s.pendingOptionalResolutions, r)
@@ -320,7 +354,11 @@ func (s *Instance) RequireFeatures(callback interface{}, optional bool) error {
 
 // AddFeature registers a feature into current Instance.
 func (s *Instance) AddFeature(feature features.Feature) error {
-	if s.running {
+	s.statusLock.Lock()
+	running := s.running
+	s.statusLock.Unlock()
+
+	if running {
 		if err := feature.Start(); err != nil {
 			errors.LogInfoInner(s.ctx, err, "failed to start feature")
 		}
@@ -366,17 +404,21 @@ func (s *Instance) AddFeature(feature features.Feature) error {
 		}
 	}
 	s.pendingOptionalResolutions = pendingOptional
+	featureList := copyFeatures(s.features)
 	s.resolveLock.Unlock()
 
 	var err error
 	for _, r := range availableResolution {
-		err = r.callbackResolution(s.features) // only return the last error for now
+		err = r.callbackResolution(featureList) // only return the last error for now
 	}
 	return err
 }
 
 // GetFeature returns a feature of the given type, or nil if such feature is not registered.
 func (s *Instance) GetFeature(featureType interface{}) features.Feature {
+	s.resolveLock.RLock()
+	defer s.resolveLock.RUnlock()
+
 	return getFeature(s.features, reflect.TypeOf(featureType))
 }
 
@@ -388,8 +430,12 @@ func (s *Instance) Start() error {
 	s.statusLock.Lock()
 	defer s.statusLock.Unlock()
 
+	s.resolveLock.RLock()
+	featureList := copyFeatures(s.features)
+	s.resolveLock.RUnlock()
+
 	s.running = true
-	for _, f := range s.features {
+	for _, f := range featureList {
 		if err := f.Start(); err != nil {
 			return err
 		}

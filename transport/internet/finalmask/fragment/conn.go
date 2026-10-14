@@ -46,7 +46,10 @@ func (c *fragmentConn) Splice() bool {
 // lengthForSegment returns the length range (min, max) for the given segment index (0-based).
 // Clamps to the last entry when the index exceeds the list length.
 func (c *fragmentConn) lengthForSegment(segIdx int) (int64, int64) {
-	if segIdx >= len(c.config.LengthsMin) {
+	if len(c.config.LengthsMin) == 0 {
+		return 1, 1
+	}
+	if segIdx < 0 || segIdx >= len(c.config.LengthsMin) {
 		segIdx = len(c.config.LengthsMin) - 1
 	}
 	return c.config.LengthsMin[segIdx], c.config.LengthsMax[segIdx]
@@ -55,10 +58,31 @@ func (c *fragmentConn) lengthForSegment(segIdx int) (int64, int64) {
 // delayForSegment returns the delay range (min, max) for the given segment index (0-based).
 // Clamps to the last entry when the index exceeds the list length.
 func (c *fragmentConn) delayForSegment(segIdx int) (int64, int64) {
-	if segIdx >= len(c.config.DelaysMin) {
+	if len(c.config.DelaysMin) == 0 {
+		return 0, 0
+	}
+	if segIdx < 0 || segIdx >= len(c.config.DelaysMin) {
 		segIdx = len(c.config.DelaysMin) - 1
 	}
 	return c.config.DelaysMin[segIdx], c.config.DelaysMax[segIdx]
+}
+
+// nextSegmentEnd picks the exclusive end offset of the next segment starting at
+// from. It always returns a value strictly greater than from: a configured
+// minimum of 0 would otherwise let the split loops emit zero-length records
+// forever without ever advancing.
+func nextSegmentEnd(from int, dataLen int, lengthMin, lengthMax int64, maxSplit int64, splitNum int64) int {
+	to := from + int(crypto.RandBetween(lengthMin, lengthMax))
+	if to > dataLen || (maxSplit > 0 && splitNum+1 >= maxSplit) {
+		to = dataLen
+	}
+	if to <= from {
+		to = from + 1
+	}
+	if to > dataLen {
+		to = dataLen
+	}
+	return to
 }
 
 // mergeTlsHelloSegments returns true only when delays has exactly one zero entry.
@@ -85,10 +109,7 @@ func (c *fragmentConn) Write(p []byte) (n int, err error) {
 		var splitNum int64
 		for from := 0; ; {
 			lengthMin, lengthMax := c.lengthForSegment(int(splitNum))
-			to := from + int(crypto.RandBetween(lengthMin, lengthMax))
-			if to > len(data) || (maxSplit > 0 && splitNum+1 >= maxSplit) {
-				to = len(data)
-			}
+			to := nextSegmentEnd(from, len(data), lengthMin, lengthMax, maxSplit, splitNum)
 			l := to - from
 			if 5+l > len(buff) {
 				buff = make([]byte, 5+l)
@@ -136,10 +157,7 @@ func (c *fragmentConn) Write(p []byte) (n int, err error) {
 	var splitNum int64
 	for from := 0; ; {
 		lengthMin, lengthMax := c.lengthForSegment(int(splitNum))
-		to := from + int(crypto.RandBetween(lengthMin, lengthMax))
-		if to > len(p) || (maxSplit > 0 && splitNum+1 >= maxSplit) {
-			to = len(p)
-		}
+		to := nextSegmentEnd(from, len(p), lengthMin, lengthMax, maxSplit, splitNum)
 		n, err := c.Conn.Write(p[from:to])
 		from += n
 		if err != nil {

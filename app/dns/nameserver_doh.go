@@ -202,6 +202,8 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				}
 				return
 			}
+			defer b.Release()
+
 			resp, err := s.dohHTTPSContext(dnsCtx, b.Bytes())
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "failed to retrieve response for ", fqdn)
@@ -254,4 +256,12 @@ func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, 
 // QueryIP implements Server.
 func (s *DoHNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {
 	return queryIP(ctx, s, domain, option)
+}
+
+// Close implements common.Closable.
+func (s *DoHNameServer) Close() error {
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
+	}
+	return s.cacheController.Close()
 }

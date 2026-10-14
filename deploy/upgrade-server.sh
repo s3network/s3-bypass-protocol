@@ -72,6 +72,17 @@ die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() { awk 'NR>1 && /^#/ {print} NR>1 && !/^#/ {exit}' "$0"; }
 
+# count_arg rejects anything that is not a non-negative whole number, here and
+# now rather than at the first arithmetic expression that touches it: `--keep abc`
+# used to sail through argument parsing and take the script down with an
+# "integer expression expected" from set -e's arithmetic evaluation, after it had
+# already downloaded and verified a release.
+count_arg() {
+  case "$2" in
+    ''|*[!0-9]*) die "$1 needs a non-negative number, got '$2'" ;;
+  esac
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --version)  VERSION="${2:?--version needs a tag}"; shift 2 ;;
@@ -81,8 +92,8 @@ while [ $# -gt 0 ]; do
     --service)  SERVICE_OVERRIDE="${2:?--service needs a unit name}"; shift 2 ;;
     --config)   CONFIG_OVERRIDE="${2:?--config needs a path}"; shift 2 ;;
     --sha256)   SHA_OVERRIDE="${2:?--sha256 needs a digest}"; shift 2 ;;
-    --keep)     KEEP_BACKUPS="${2:?--keep needs a number}"; shift 2 ;;
-    --settle)   SETTLE_SECONDS="${2:?--settle needs seconds}"; shift 2 ;;
+    --keep)     count_arg "$1" "${2:?--keep needs a number}"; KEEP_BACKUPS="$2"; shift 2 ;;
+    --settle)   count_arg "$1" "${2:?--settle needs seconds}"; SETTLE_SECONDS="$2"; shift 2 ;;
     --dry-run)  DRY_RUN=1; shift ;;
     --status)   STATUS_ONLY=1; shift ;;
     -h|--help)  usage; exit 0 ;;

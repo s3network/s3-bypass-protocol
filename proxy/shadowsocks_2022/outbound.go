@@ -85,7 +85,12 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 	defer connection.Close()
 
 	if session.TimeoutOnlyFromContext(ctx) {
-		ctx, _ = context.WithCancel(context.Background())
+		// The new context only carries the inactivity timeout, so it has to be
+		// cancelled once this connection is done, otherwise it (and its timer)
+		// leaks for every dialed connection.
+		var newCancel context.CancelFunc
+		ctx, newCancel = context.WithCancel(context.Background())
+		defer newCancel()
 	}
 
 	if network == net.Network_TCP {

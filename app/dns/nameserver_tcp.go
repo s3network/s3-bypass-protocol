@@ -159,6 +159,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				}
 				return
 			}
+			defer b.Release()
 
 			conn, err := s.dial(dnsCtx)
 			if err != nil {
@@ -169,7 +170,16 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				return
 			}
 			defer conn.Close()
+
+			// context cancellation does not interrupt the blocking reads
+			// below, so arm a read deadline to keep this goroutine bounded
+			if err := conn.SetReadDeadline(deadline); err != nil {
+				errors.LogWarningInner(ctx, err, "failed to set read deadline")
+			}
+			defer conn.SetReadDeadline(time.Time{})
+
 			dnsReqBuf := buf.New()
+			defer dnsReqBuf.Release()
 			err = binary.Write(dnsReqBuf, binary.BigEndian, uint16(b.Len()))
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "binary write failed")
@@ -186,7 +196,6 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				}
 				return
 			}
-			b.Release()
 
 			_, err = conn.Write(dnsReqBuf.Bytes())
 			if err != nil {
@@ -196,7 +205,6 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				}
 				return
 			}
-			dnsReqBuf.Release()
 
 			respBuf := buf.New()
 			defer respBuf.Release()
@@ -244,4 +252,9 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 // QueryIP implements Server.
 func (s *TCPNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {
 	return queryIP(ctx, s, domain, option)
+}
+
+// Close implements common.Closable.
+func (s *TCPNameServer) Close() error {
+	return s.cacheController.Close()
 }

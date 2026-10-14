@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"os"
+	"strings"
 
 	"github.com/xtls/xray-core/main/commands/base"
 	_ "github.com/xtls/xray-core/main/distro/all"
@@ -26,7 +27,7 @@ func getArgsV4Compatible() []string {
 	if len(os.Args) == 1 {
 		return []string{os.Args[0], "run"}
 	}
-	if os.Args[1][0] != '-' {
+	if !strings.HasPrefix(os.Args[1], "-") {
 		return os.Args
 	}
 	version := false

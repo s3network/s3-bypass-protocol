@@ -98,6 +98,11 @@ func (s *routingServer) TestRoute(ctx context.Context, request *TestRouteRequest
 		return nil, err
 	}
 	if request.PublishResult && s.routingStats != nil {
+		// The cancel func is deliberately not called here. Publish hands the
+		// context to a goroutine that outlives this call, so cancelling on
+		// return would abort the publication. The context is bounded by the
+		// timeout, so it releases itself once that elapses; go vet's lostcancel
+		// does not apply.
 		ctx, _ := context.WithTimeout(context.Background(), 4*time.Second)
 		s.routingStats.Publish(ctx, route)
 	}

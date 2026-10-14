@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/proxy/fedarisha/storage"
@@ -83,6 +84,43 @@ const DefaultSessionsDir = "sessions"
 // which died mid-handshake stops costing requests within a minute, because
 // until it does, every poll tick re-reads a file that can only answer 404.
 var staleSessionProbeWindow = 60 * time.Second
+
+// Per-call budgets for the listener's own storage calls.
+//
+// Every one of these used l.ctx — the context of the whole listener — with no
+// deadline of its own. The watchLoop goroutine runs scanForNewSessions on
+// itself, and that List is the gateway to every user's sessions: one backend
+// that accepts the request and then says nothing parks that goroutine
+// indefinitely, and session discovery stops for EVERY user on the inbound with
+// nothing in the log. A per-call deadline turns "the loop is stuck" into "this
+// one list failed", which the poll retries and the operator can see.
+//
+// Vars, shortened by the specs that measure them. Atomics for the same reason
+// listTimeoutNanos is one: the values are read on goroutines the shortening
+// test does not own. Zero means "use the default".
+var (
+	listCallTimeoutNanos      atomic.Int64
+	handshakeCallTimeoutNanos atomic.Int64
+)
+
+const (
+	defaultListCallTimeout      = 4 * time.Second
+	defaultHandshakeCallTimeout = 10 * time.Second
+)
+
+func listTimeout() time.Duration {
+	if v := listCallTimeoutNanos.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return defaultListCallTimeout
+}
+
+func handshakeTimeout() time.Duration {
+	if v := handshakeCallTimeoutNanos.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return defaultHandshakeCallTimeout
+}
 
 func effectiveSessionsDir(dir string) string {
 	if strings.TrimSpace(dir) == "" {
@@ -245,7 +283,9 @@ func (l *Listener) scanForNewSessions() {
 	}
 
 	// Multi-user: list user directories, then scan {user}/sessions/ for each.
-	users, err := l.Store.List(l.ctx, "", "")
+	listCtx, cancel := context.WithTimeout(l.ctx, listTimeout())
+	users, err := l.Store.List(listCtx, "", "")
+	cancel()
 	if err != nil {
 		log.Printf("[fedarisha-server] list users error: %v", err)
 		return
@@ -259,7 +299,7 @@ func (l *Listener) scanForNewSessions() {
 }
 
 func (l *Listener) scanSessionsIn(sessionsDir string) {
-	dirs, err := l.Store.List(l.ctx, sessionsDir, "")
+	dirs, err := l.listDir(sessionsDir)
 	if err != nil {
 		return // Directory may not exist yet.
 	}
@@ -347,6 +387,36 @@ func (l *Listener) forgetNoHello(sessDir string) {
 	l.noHelloMu.Unlock()
 }
 
+// downloadHandshakeFile GETs one handshake file under its own deadline, so a
+// store that accepts the request and then goes quiet cannot park the handshake
+// goroutine (and its slot in the handshake semaphore) forever.
+func (l *Listener) downloadHandshakeFile(path string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(l.ctx, handshakeTimeout())
+	defer cancel()
+	return l.Store.Download(ctx, path)
+}
+
+// deleteSessionFile removes one session file under its own deadline. Its
+// failures are reported: a hello left behind is re-probed on every tick.
+func (l *Listener) deleteSessionFile(path string) {
+	ctx, cancel := context.WithTimeout(l.ctx, handshakeTimeout())
+	defer cancel()
+	if err := l.Store.Delete(ctx, path); err != nil {
+		log.Printf("[fedarisha-server] delete of %s failed: %v", shortID(path), err)
+	}
+}
+
+// listDir lists one directory under the listener's own deadline.
+//
+// Called on the watch loop, which is shared by every user's discovery: a List
+// with no budget is a single slow backend stopping session detection for the
+// whole inbound.
+func (l *Listener) listDir(dir string) ([]storage.FileInfo, error) {
+	ctx, cancel := context.WithTimeout(l.ctx, listTimeout())
+	defer cancel()
+	return l.Store.List(ctx, dir, "")
+}
+
 // acceptSession performs the key exchange handshake for a single session directory
 // and enqueues the resulting connection.
 func (l *Listener) acceptSession(sessDir string) {
@@ -388,14 +458,14 @@ func (l *Listener) acceptSession(sessDir string) {
 		l.knownMu.Lock()
 		l.known[sessDir] = true
 		l.knownMu.Unlock()
-		_ = l.Store.Delete(l.ctx, sessDir+"/"+HelloFile)
+		l.deleteSessionFile(sessDir + "/" + HelloFile)
 		log.Printf("[fedarisha-server] session %s rejected: user %q not allowed", shortID(sessID), userPrefix)
 		return
 	}
 
 	// Check for hello file (contains sessID + client public key).
 	helloPath := sessDir + "/" + HelloFile
-	data, err := l.Store.Download(l.ctx, helloPath)
+	data, err := l.downloadHandshakeFile(helloPath)
 	if err != nil || len(data) == 0 {
 		// No hello yet. This is normal for the first moments of a connection,
 		// but it is not a state worth re-probing forever: an abandoned
@@ -426,7 +496,7 @@ func (l *Listener) acceptSession(sessDir string) {
 	l.known[sessDir] = true
 	l.knownMu.Unlock()
 
-	_ = l.Store.Delete(l.ctx, helloPath)
+	l.deleteSessionFile(helloPath)
 
 	// Generate server X25519 key pair and derive shared secret.
 	privKey, pubKey, err := GenerateX25519()
@@ -442,8 +512,18 @@ func (l *Listener) acceptSession(sessDir string) {
 	}
 
 	// Write ACK with server's public key.
+	//
+	// uploadRetrying retries until the store takes the file or its context
+	// ends, and l.ctx ends with the listener. So a backend that refuses this
+	// upload holds one of the 16 handshake slots for the life of the process,
+	// and once sixteen such sessions pile up the 17th is never dispatched at
+	// all — session detection quietly stops. The ACK gets the same budget the
+	// client's dial gets.
 	ackPath := sessDir + "/" + AckFile
-	if err := uploadRetrying(l.ctx, l.Store, ackPath, pubKey, "ack"); err != nil {
+	ackCtx, cancelAck := context.WithTimeout(l.ctx, DialBudget())
+	err = uploadRetrying(ackCtx, l.Store, ackPath, pubKey, "ack")
+	cancelAck()
+	if err != nil {
 		log.Printf("[fedarisha-server] failed to ACK session %s: %v", shortID(sessID), err)
 		return
 	}

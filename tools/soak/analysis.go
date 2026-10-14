@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -81,7 +82,13 @@ type Bucket struct {
 // Bucket width is chosen by the caller, not derived: the caller knows whether
 // it is watching for a 20-second hitch or a 5-minute outage, and a tool that
 // picks its own resolution hides exactly the thing it was pointed at.
-func Bucketize(transfers []Transfer, start time.Time, width time.Duration, th Thresholds) []Bucket {
+//
+// runEnd is optional. Without it every slice is normalised by the full width,
+// which makes the LAST slice of a run look slower than it was: a 10-second tail
+// measured against a 30-second bucket reads as a third of the throughput, and
+// the dip lands at the end of every report — which is where a reader looks
+// least.
+func Bucketize(transfers []Transfer, start time.Time, width time.Duration, th Thresholds, runEnd ...time.Time) []Bucket {
 	if width <= 0 {
 		return nil
 	}
@@ -119,9 +126,26 @@ func Bucketize(transfers []Transfer, start time.Time, width time.Duration, th Th
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Start.Before(out[j].Start) })
 	for i := range out {
-		out[i].Throughput = float64(out[i].Bytes) / width.Seconds()
+		out[i].Throughput = float64(out[i].Bytes) / bucketSpan(out[i].Start, start, width, runEnd).Seconds()
 	}
 	return out
+}
+
+// bucketSpan is how long a slice actually covered: its width, clipped to where
+// the run ended.
+func bucketSpan(bucketStart, runStart time.Time, width time.Duration, runEnd []time.Time) time.Duration {
+	full := width
+	if len(runEnd) == 0 {
+		return full
+	}
+	sliceEnd := runStart.Add(time.Duration(int64(bucketStart.Sub(runStart)/width)+1) * width)
+	if !runEnd[0].Before(sliceEnd) {
+		return full
+	}
+	if trimmed := runEnd[0].Sub(bucketStart); trimmed > 0 {
+		return trimmed
+	}
+	return full
 }
 
 // Summary is what a soak actually reports.
@@ -211,22 +235,41 @@ func lastOrZero(d []time.Duration) time.Duration {
 	return d[len(d)-1]
 }
 
+// medianOf takes the mean of the two central values on an even count.
+//
+// sorted[len/2] was the upper of the two, so with an even number of transfers
+// "median first byte" reported the WORST of the middle pair — every headline
+// figure for a healthy run sat at its pessimistic end.
 func medianOf(sorted []time.Duration) time.Duration {
-	if len(sorted) == 0 {
+	n := len(sorted)
+	switch {
+	case n == 0:
 		return 0
+	case n%2 == 1:
+		return sorted[n/2]
+	default:
+		return (sorted[n/2-1] + sorted[n/2]) / 2
 	}
-	return sorted[len(sorted)/2]
 }
 
+// percentileOf is the nearest-rank percentile: rank = ceil(p*n), clamped.
+//
+// The old index was int(n*p), which runs off the end for any p at n=10 — p90
+// and p100 both landed on the last element, so the headline p90 was the worst
+// value in the run and could not be told from it.
 func percentileOf(sorted []time.Duration, p float64) time.Duration {
-	if len(sorted) == 0 {
+	n := len(sorted)
+	if n == 0 {
 		return 0
 	}
-	i := int(float64(len(sorted)) * p)
-	if i >= len(sorted) {
-		i = len(sorted) - 1
+	rank := int(math.Ceil(p * float64(n)))
+	if rank < 1 {
+		rank = 1
 	}
-	return sorted[i]
+	if rank > n {
+		rank = n
+	}
+	return sorted[rank-1]
 }
 
 // --- log correlation ---------------------------------------------------------

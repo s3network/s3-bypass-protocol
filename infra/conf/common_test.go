@@ -203,6 +203,43 @@ func TestOverRangeStringPort(t *testing.T) {
 	}
 }
 
+func TestPortListNumericPort(t *testing.T) {
+	var list PortList
+	common.Must(json.Unmarshal([]byte("1234"), &list))
+
+	if r := cmp.Diff(list.Range, []PortRange{{From: 1234, To: 1234}}); r != "" {
+		t.Error(r)
+	}
+}
+
+// A numeric port out of uint16 range used to be truncated silently, so the
+// server listened on a port nobody asked for (70000 -> 4464, 65536 -> 0).
+func TestOverRangeIntPortList(t *testing.T) {
+	for _, rawPort := range []string{"65536", "70000", "131072", "4294967295"} {
+		var list PortList
+		if err := json.Unmarshal([]byte(rawPort), &list); err == nil {
+			t.Error("expected error for port ", rawPort, ", but got ", list.String())
+		}
+	}
+}
+
+// A reversed range never matches anything, so it must be rejected instead of
+// being silently kept.
+func TestReversedPortListRange(t *testing.T) {
+	for _, rawRange := range []string{`"8080-80"`, `"2-1"`, `"1000-999"`} {
+		var list PortList
+		if err := json.Unmarshal([]byte(rawRange), &list); err == nil {
+			t.Error("expected error for port range ", rawRange, ", but got ", list.String())
+		}
+	}
+
+	var list PortList
+	common.Must(json.Unmarshal([]byte(`"80-8080"`), &list))
+	if r := cmp.Diff(list.Range, []PortRange{{From: 80, To: 8080}}); r != "" {
+		t.Error(r)
+	}
+}
+
 func TestUserParsing(t *testing.T) {
 	user := new(User)
 	common.Must(json.Unmarshal([]byte(`{

@@ -10,6 +10,7 @@ set -euo pipefail
 
 REPO="${REPO:-https://github.com/s3network/s3-bypass-protocol}"
 VERSION="${VERSION:?set VERSION to a release tag, e.g. VERSION=v0.1.0-fork.1}"
+SHA256="${SHA256:?set SHA256 to the published digest of the release archive; this script will not install an unverified binary}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/s3bypass-protocol}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/s3bypass-protocol}"
 STATE_DIR="${STATE_DIR:-/var/lib/s3bypass-protocol}"
@@ -39,15 +40,21 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT
 curl -fsSL "${BINARY_URL}" -o "${tmp}/core.zip"
 # Verify the published digest before running anything from it.
-if [ -n "${SHA256:-}" ]; then
-  echo "${SHA256}  ${tmp}/core.zip" | sha256sum -c - >/dev/null \
-    || die "SHA-256 mismatch for the downloaded archive"
-  log "digest verified"
-else
-  log "WARNING: SHA256 not set — skipping digest verification"
-fi
+#
+# Mandatory, not optional. It used to warn and continue, so the common case —
+# an operator who forgets to export SHA256 — installed and ran an unverified
+# binary as root and was told, in a line that scrolls past, that nothing had
+# been checked. The upgrade path has always refused to do this
+# (upgrade-server.sh: "refusing an unverifiable binary"); this script has to
+# agree with it.
+echo "${SHA256}  ${tmp}/core.zip" | sha256sum -c - >/dev/null \
+  || die "SHA-256 mismatch for the downloaded archive"
+log "digest verified"
 unzip -q "${tmp}/core.zip" -d "${tmp}/unpacked"
-found="$(find "${tmp}/unpacked" -type f -name xray | head -1)"
+# -print -quit rather than `| head -1`: under pipefail, head closing the pipe
+# early can hand find a SIGPIPE and fail a search that actually succeeded, which
+# here means aborting an install that was about to work.
+found="$(find "${tmp}/unpacked" -type f -name xray -print -quit)"
 [ -n "${found}" ] || die "no xray binary inside the archive"
 install -m 0755 -o root -g root "${found}" "${BINARY_PATH}"
 

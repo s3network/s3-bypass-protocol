@@ -140,3 +140,25 @@ func TestParseHost(t *testing.T) {
 		}
 	}
 }
+
+// A port from a Host header that does not fit into uint16 used to be truncated
+// silently (70000 -> 4464, -1 -> 65535), sending the connection somewhere else.
+func TestParseHostInvalidPort(t *testing.T) {
+	for _, rawHost := range []string{
+		"example.com:70000",
+		"example.com:65536",
+		"example.com:-1",
+		"example.com:131072",
+		"[2401:1bc0:51f0:ec08::1]:70000",
+	} {
+		if dest, err := ParseHost(rawHost, 443); err == nil {
+			t.Error("for test case: ", rawHost, " expected error, but got ", dest.String())
+		}
+	}
+
+	dest, err := ParseHost("example.com:65535", 443)
+	common.Must(err)
+	if dest.Port != net.Port(65535) {
+		t.Error("expected port 65535, but got ", dest.Port)
+	}
+}

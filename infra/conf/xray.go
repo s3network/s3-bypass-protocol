@@ -295,15 +295,24 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 
 	if c.SendThrough != nil {
 		address := ParseSendThough(c.SendThrough)
+		if address.Address == nil {
+			return nil, errors.New("unable to send through: " + *c.SendThrough)
+		}
 		// Check if CIDR exists
-		if strings.Contains(*c.SendThrough, "/") {
-			senderSettings.ViaCidr = strings.Split(*c.SendThrough, "/")[1]
-		} else {
-			if address.Family().IsDomain() {
-				domain := address.Address.Domain()
-				if domain != "origin" && domain != "srcip" {
-					return nil, errors.New("unable to send through: " + address.String())
-				}
+		if _, rawCidr, hasSlash := strings.Cut(*c.SendThrough, "/"); hasSlash {
+			if strings.Contains(rawCidr, "/") || !address.Family().IsIP() {
+				return nil, errors.New("unable to send through: " + *c.SendThrough)
+			}
+			if _, _, err := net.ParseCIDR(address.Address.IP().String() + "/" + rawCidr); err != nil {
+				return nil, errors.New("invalid sendThrough CIDR: " + rawCidr).Base(err)
+			}
+			senderSettings.ViaCidr = rawCidr
+		}
+		// "origin" and "srcip" are the only accepted domains, with or without CIDR.
+		if address.Family().IsDomain() {
+			domain := address.Address.Domain()
+			if domain != "origin" && domain != "srcip" {
+				return nil, errors.New("unable to send through: " + address.String())
 			}
 		}
 		senderSettings.Via = address.Build()
@@ -606,11 +615,6 @@ func (c *Config) Build() (*core.Config, error) {
 
 	if c.Reverse != nil {
 		return nil, errors.PrintRemovedFeatureError(`"legacy reverse"`, `"VLESS Reverse Proxy"`)
-		r, err := c.Reverse.Build()
-		if err != nil {
-			return nil, errors.New("failed to build reverse configuration").Base(err)
-		}
-		config.App = append(config.App, serial.ToTypedMessage(r))
 	}
 
 	if c.FakeDNS != nil {

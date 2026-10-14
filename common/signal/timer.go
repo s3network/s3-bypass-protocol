@@ -81,5 +81,13 @@ func CancelAfterInactivity(ctx context.Context, cancel context.CancelFunc, timeo
 		onTimeout: cancel,
 	}
 	timer.SetTimeout(timeout)
+	if ctx != nil && ctx.Done() != nil {
+		// Without this the timer keeps its periodic task alive until the
+		// inactivity timeout fires, even when the owning context is already gone.
+		go func() {
+			<-ctx.Done()
+			timer.finish()
+		}()
+	}
 	return timer
 }

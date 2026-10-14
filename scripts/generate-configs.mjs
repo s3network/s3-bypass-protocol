@@ -22,7 +22,16 @@
 // --secret-file reads the secret key from a file instead of argv, so it does
 // not land in the shell history or in `ps` output.
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { chmodSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+
+// writeFileSync's mode only applies when it CREATES the file. Regenerating over
+// a config that already exists leaves whatever mode that file had, so a rerun
+// after the first one could leave the storage credentials world-readable.
+// chmod after the write is the only thing that actually enforces 0600.
+function writeSecret(path, contents) {
+  writeFileSync(path, contents, { mode: 0o600 })
+  chmodSync(path, 0o600)
+}
 import { resolve, join } from 'node:path'
 
 const args = process.argv.slice(2)
@@ -110,7 +119,7 @@ const server = {
 }
 
 const serverPath = join(outDir, 'server.json')
-writeFileSync(serverPath, JSON.stringify(server, null, 2), { mode: 0o600 })
+writeSecret(serverPath, JSON.stringify(server, null, 2))
 
 // --- clients ----------------------------------------------------------------
 // Shape matches what the desktop client accepts: one loopback SOCKS inbound and
@@ -211,7 +220,7 @@ for (const user of users) {
 
   for (const [, config, name] of wanted) {
     const p = join(outDir, name)
-    writeFileSync(p, JSON.stringify(config, null, 2), { mode: 0o600 })
+    writeSecret(p, JSON.stringify(config, null, 2))
     clientPaths.push([name, config])
   }
 }

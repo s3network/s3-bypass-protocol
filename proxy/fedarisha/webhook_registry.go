@@ -119,6 +119,22 @@ func registerWebhook(ctx context.Context, tag string, storageConfig *StorageConf
 	setupPrefix := group.setupPrefixForBucket(storageConfig.GetBucket())
 	sharedWebhooks.Unlock()
 
+	// From here the hub is counted: it is in group.hubs, the endpoint's refcount
+	// includes it, and every later inbound on this endpoint will have its
+	// prefix checked against it. The cleanup is therefore armed now, before the
+	// first early return, and disarmed only on the success path at the bottom.
+	//
+	// It used to be armed on that path alone, so the autoSetup branch's
+	// "requires s3 storage" return left the hub registered forever: refs never
+	// reached zero again, the listener was never shut down, and validatePrefix
+	// kept rejecting the next inbound that wanted an overlapping prefix.
+	registered := true
+	defer func() {
+		if registered {
+			unregisterWebhook(cfg.GetListen(), path, hub)
+		}
+	}()
+
 	if cfg.GetAutoSetup() {
 		setupper, ok := store.(webhookSetupper)
 		if !ok {
@@ -131,6 +147,7 @@ func registerWebhook(ctx context.Context, tag string, storageConfig *StorageConf
 	}
 
 	log.Printf("[fedarisha] inbound %q: webhook enabled on %s%s", tag, cfg.GetListen(), path)
+	registered = false
 	return hub, func() {
 		unregisterWebhook(cfg.GetListen(), path, hub)
 	}, nil
@@ -142,6 +159,16 @@ func newWebhookEndpoint(listen, tlsCert, tlsKey string) (*webhookEndpoint, error
 		Addr:              listen,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		// The body limit below is enforced per request, but a request that
+		// opens a connection and then dribbles — or never sends a body at all —
+		// is held open by the server for as long as ReadHeaderTimeout allows,
+		// and each one costs a goroutine and a socket. These bound the whole
+		// exchange, not just its first bytes.
+		ReadTimeout: 30 * time.Second,
+		// Keep-alive connections were left with no bound at all, so a client
+		// could hold one open indefinitely after its last POST.
+		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
@@ -270,13 +297,21 @@ func commonS3Prefix(prefixes []string) string {
 	return prefix[:idx+1]
 }
 
+// webhookMaxBodyBytes caps one notification body.
+//
+// The handler is public (it is whatever URL S3 was told to post to) and read
+// the body with a bare io.ReadAll, so a request that never stopped sending
+// grew the process until it died. A notification carrying the key it fired on
+// is a few hundred bytes; a megabyte is already far past any real event.
+const webhookMaxBodyBytes = 1 << 20
+
 func (g *webhookGroup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, webhookMaxBodyBytes))
 	if err != nil {
 		http.Error(w, "read error", http.StatusBadRequest)
 		return

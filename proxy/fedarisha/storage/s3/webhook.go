@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -25,7 +27,7 @@ import (
 // permanently with nothing logged.
 const webhookClientTimeout = 30 * time.Second
 
-// webhookHTTPClient returns the client used for the notification call.
+// webhookHTTPClientInstance is the client used for the notification call.
 //
 // Not http.DefaultClient: that one has no timeout, it is process-global, and
 // borrowing it means anything else in the program can change our timeout or
@@ -33,20 +35,111 @@ const webhookClientTimeout = 30 * time.Second
 // because the failure this guards against is precisely a server that completes
 // the handshake and then goes quiet — which an overall deadline covers, but one
 // that reads as a timeout rather than as a mystery.
-func webhookHTTPClient() *http.Client {
-	return &http.Client{
-		Timeout: webhookClientTimeout,
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			ResponseHeaderTimeout: webhookClientTimeout,
-			IdleConnTimeout:       30 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
+//
+// It is built ONCE. The previous version constructed a whole
+// Transport per call and never closed idle connections, so every SetupWebhook
+// left its own private connection pool behind; the call happens once per inbound
+// at startup, which is exactly the shape of a leak nobody notices until a
+// config reload loop makes it one.
+var webhookHTTPClientInstance = &http.Client{
+	Timeout: webhookClientTimeout,
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: webhookClientTimeout,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+	},
+}
+
+// webhookHTTPClient returns the shared notification client.
+func webhookHTTPClient() *http.Client { return webhookHTTPClientInstance }
+
+// notificationConfig is the VK Cloud S3 SimpleTopicConfiguration document.
+//
+// It is built with encoding/xml rather than a format string. The prefix and the
+// webhook URL both come from configuration, and a format string pastes them
+// into the document raw: a prefix containing "<" closes the element early and
+// the rest of the string is read as markup, so the configuration that gets
+// installed is not the configuration that was asked for.
+type notificationConfig struct {
+	XMLName xml.Name `xml:"NotificationConfiguration"`
+	Xmlns   string   `xml:"xmlns,attr"`
+	Topic   simpleTopic
+}
+
+type simpleTopic struct {
+	XMLName xml.Name `xml:"SimpleTopicConfiguration"`
+	ID      string   `xml:"Id"`
+	Event   string   `xml:"Event"`
+	URL     string   `xml:"Url"`
+	Filter  topicFilter
+}
+
+type topicFilter struct {
+	S3Key s3KeyFilter
+}
+
+type s3KeyFilter struct {
+	FilterRule []filterRule `xml:"FilterRule"`
+}
+
+type filterRule struct {
+	Name  string `xml:"Name"`
+	Value string `xml:"Value"`
+}
+
+func buildNotificationConfig(webhookURL, prefix string) ([]byte, error) {
+	doc := notificationConfig{
+		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
+		Topic: simpleTopic{
+			ID:    "fedarisha",
+			Event: "s3:ObjectCreated:Put",
+			URL:   webhookURL,
+			Filter: topicFilter{S3Key: s3KeyFilter{FilterRule: []filterRule{
+				{Name: "Prefix", Value: prefix},
+			}}},
 		},
 	}
+	body, err := xml.MarshalIndent(doc, "", "   ")
+	if err != nil {
+		return nil, fmt.Errorf("build notification configuration: %w", err)
+	}
+	return append([]byte(xml.Header), body...), nil
+}
+
+// notificationURL builds the virtual-hosted bucket URL for the notification
+// call: {scheme}://{bucket}.{host}/{path}?notification
+//
+// Parsed rather than sliced with TrimPrefix: an endpoint with a path, a port and
+// no scheme, or a trailing slash produced a URL that pointed somewhere else
+// entirely — and a mis-signed request to the wrong host fails as a signature
+// error, which looks like bad credentials rather than a bad URL.
+func notificationURL(endpoint, bucket, region string) (string, error) {
+	if endpoint == "" {
+		endpoint = fmt.Sprintf("https://s3.%s.amazonaws.com", region)
+	}
+	if !strings.Contains(endpoint, "://") {
+		endpoint = "https://" + endpoint
+	}
+	base, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("parse storage endpoint %q: %w", endpoint, err)
+	}
+	if base.Host == "" {
+		return "", fmt.Errorf("storage endpoint %q has no host", endpoint)
+	}
+
+	out := url.URL{
+		Scheme:   base.Scheme,
+		Host:     bucket + "." + base.Host,
+		Path:     strings.TrimSuffix(base.Path, "/") + "/",
+		RawQuery: "notification",
+	}
+	return out.String(), nil
 }
 
 // SetupWebhook configures S3 bucket notification to send ObjectCreated events
@@ -56,40 +149,17 @@ func webhookHTTPClient() *http.Client {
 // prefix filters events to keys starting with the given prefix (e.g. "projects/sessions/").
 // webhookURL is the public HTTP endpoint that will receive POST notifications.
 func (s *S3Store) SetupWebhook(ctx context.Context, webhookURL, prefix string) error {
-	xmlBody := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-   <SimpleTopicConfiguration>
-      <Id>fedarisha</Id>
-      <Event>s3:ObjectCreated:Put</Event>
-      <Url>%s</Url>
-      <Filter>
-         <S3Key>
-            <FilterRule>
-               <Name>Prefix</Name>
-               <Value>%s</Value>
-            </FilterRule>
-         </S3Key>
-      </Filter>
-   </SimpleTopicConfiguration>
-</NotificationConfiguration>`, webhookURL, prefix)
-
-	// VK Cloud S3 uses virtual-hosted style: {bucket}.{host}/?notification
-	// Standard AWS also uses this by default.
-	endpoint := s.cfg.Endpoint
-	if endpoint == "" {
-		endpoint = fmt.Sprintf("https://s3.%s.amazonaws.com", s.cfg.Region)
+	body, err := buildNotificationConfig(webhookURL, prefix)
+	if err != nil {
+		return err
 	}
-	// Extract host from endpoint to build virtual-hosted URL.
-	host := strings.TrimPrefix(endpoint, "https://")
-	host = strings.TrimPrefix(host, "http://")
-	scheme := "https://"
-	if strings.HasPrefix(endpoint, "http://") {
-		scheme = "http://"
-	}
-	url := fmt.Sprintf("%s%s.%s/?notification", scheme, s.cfg.Bucket, host)
 
-	body := []byte(xmlBody)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
+	target, err := notificationURL(s.cfg.Endpoint, s.cfg.Bucket, s.cfg.Region)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -120,7 +190,7 @@ func (s *S3Store) SetupWebhook(ctx context.Context, webhookURL, prefix string) e
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 		return fmt.Errorf("S3 notification config failed (HTTP %d): %s", resp.StatusCode, string(respBody))
 	}
 

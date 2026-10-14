@@ -4,6 +4,14 @@ Documentation=https://github.com/thevladimirzh/s3-bypass-protocol
 After=network-online.target
 Wants=network-online.target
 
+# Start limiting belongs to [Unit], not [Service]: on systemd >= 230 the
+# StartLimit* settings moved there, and a copy left in [Service] is silently
+# ignored — an unknown key in a unit file produces no warning at all. So the
+# restart backoff this unit relies on to stop hammering a broken S3 API simply
+# was not in effect.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=s3bypass
@@ -19,10 +27,6 @@ ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=always
 RestartSec=5s
-# Backing off hard on a broken config is better than a restart loop that
-# hammers the S3 API.
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # The core logs to stdout; let journald keep it.
 StandardOutput=journal

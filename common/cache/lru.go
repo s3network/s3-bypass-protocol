@@ -69,11 +69,19 @@ func (l *lru) PeekKeyFromValue(value interface{}) (key interface{}, ok bool) {
 
 func (l *lru) Put(key, value interface{}) {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	e := &lruElement{key, value}
 	if v, ok := l.keyToElement.Load(key); ok {
 		element := v.(*list.Element)
+		// Drop the reverse index entry of the replaced value, otherwise
+		// valueToElement keeps every value ever stored for this key and grows
+		// without bound, bypassing the capacity limit.
+		if old, ok := element.Value.(*lruElement); ok && old.value != value {
+			l.valueToElement.CompareAndDelete(old.value, element)
+		}
 		element.Value = e
 		l.doubleLinkedlist.MoveToFront(element)
+		l.valueToElement.Store(value, element)
 	} else {
 		element := l.doubleLinkedlist.PushFront(e)
 		l.keyToElement.Store(key, element)
@@ -85,5 +93,4 @@ func (l *lru) Put(key, value interface{}) {
 			l.valueToElement.Delete(toBeRemove.Value.(*lruElement).value)
 		}
 	}
-	l.mu.Unlock()
 }

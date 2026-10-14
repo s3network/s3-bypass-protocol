@@ -284,7 +284,9 @@ func (h *Handler) SetOutboundGateway(ctx context.Context, ob *session.Outbound) 
 		addr := h.senderSettings.Via.AsAddress()
 		domain = h.senderSettings.Via.GetDomain()
 		switch {
-		case h.senderSettings.ViaCidr != "":
+		case h.senderSettings.ViaCidr != "" && addr.Family().IsIP():
+			// a CIDR only makes sense together with an IP; for a domain "Via"
+			// (including "origin"/"srcip") the branches below have to be used
 			ob.Gateway = ParseRandomIP(addr, h.senderSettings.ViaCidr)
 		case domain == "origin":
 			if inbound := session.InboundFromContext(ctx); inbound != nil {
@@ -345,7 +347,15 @@ func (h *Handler) ProxySettings() *serial.TypedMessage {
 }
 
 func ParseRandomIP(addr net.Address, prefix string) net.Address {
-	_, ipnet, _ := net.ParseCIDR(addr.IP().String() + "/" + prefix)
+	// Only an IP address can be combined with a CIDR prefix. A domain address
+	// panics on IP(), and an invalid prefix makes ParseCIDR fail.
+	if addr == nil || !addr.Family().IsIP() {
+		return addr
+	}
+	_, ipnet, err := net.ParseCIDR(addr.IP().String() + "/" + prefix)
+	if err != nil || ipnet == nil {
+		return addr
+	}
 
 	ones, bits := ipnet.Mask.Size()
 	subnetSize := new(big.Int).Lsh(big.NewInt(1), uint(bits-ones))

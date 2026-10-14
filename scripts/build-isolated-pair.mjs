@@ -9,7 +9,16 @@
 //
 // Secret hygiene: values are never printed, only booleans and key names.
 
-import { readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, readFileSync, writeFileSync } from 'node:fs'
+
+// writeFileSync's mode only applies when it CREATES the file. Regenerating over
+// an existing config leaves whatever mode that file had — so a regeneration
+// could leave the storage credentials world-readable. chmod after the write is
+// the only thing that actually enforces 0600.
+function writeSecret(path, contents) {
+  writeFileSync(path, contents, { mode: 0o600 })
+  chmodSync(path, 0o600)
+}
 
 const [, , clientPath, prefix, outClient, outServer, listenPort, userPrefix] = process.argv
 if (!clientPath || !prefix || !outClient || !outServer) {
@@ -23,6 +32,15 @@ if (!clientPath || !prefix || !outClient || !outServer) {
 // the session is never discovered. This mirrors how the real deployment issues
 // per-user configs.
 const user = userPrefix ?? 'b18-selftest'
+
+const port = Number(listenPort ?? 8443)
+// Number() on a non-number is NaN and JSON.stringify(NaN) is null: the config
+// was written with "port": null and the problem only surfaced when the server
+// refused to start.
+if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  console.error(`FAIL: listen port ${JSON.stringify(listenPort)} is not a port number`)
+  process.exit(1)
+}
 
 const client = JSON.parse(readFileSync(clientPath, 'utf8'))
 const outbound = (client.outbounds ?? []).find((o) => o?.protocol === 'fedarisha')
@@ -43,7 +61,7 @@ const isoClient = {
       : o,
   ),
 }
-writeFileSync(outClient, JSON.stringify(isoClient, null, 2), { mode: 0o600 })
+writeSecret(outClient, JSON.stringify(isoClient, null, 2))
 
 // Server: an inbound watching the same prefix.
 const isoServer = {
@@ -52,7 +70,7 @@ const isoServer = {
     {
       tag: 'fedarisha-in',
       listen: '127.0.0.1',
-      port: Number(listenPort ?? 8443),
+      port, // validated below, before anything is written
       protocol: 'fedarisha',
       settings: {
         storage: { ...storage, sessionsDir: 'sessions' },
@@ -64,7 +82,7 @@ const isoServer = {
   ],
   outbounds: [{ tag: 'direct', protocol: 'freedom', settings: {} }],
 }
-writeFileSync(outServer, JSON.stringify(isoServer, null, 2), { mode: 0o600 })
+writeSecret(outServer, JSON.stringify(isoServer, null, 2))
 
 console.log('isolated pair written')
 console.log('prefix used      :', prefix)

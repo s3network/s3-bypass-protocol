@@ -156,7 +156,11 @@ func (i *ClientInstance) Handshake(conn net.Conn) (*CommonConn, error) {
 	if _, err := io.ReadFull(conn, encryptedPfsPublicKey); err != nil {
 		return nil, err
 	}
-	nfsAEAD.Open(encryptedPfsPublicKey[:0], MaxNonce, encryptedPfsPublicKey, nil)
+	// The AEAD tag must be verified before the key material is used, otherwise
+	// a tampered server hello would silently produce a broken session key.
+	if _, err := nfsAEAD.Open(encryptedPfsPublicKey[:0], MaxNonce, encryptedPfsPublicKey, nil); err != nil {
+		return nil, errors.New("failed to decrypt the server hello").Base(err)
+	}
 	mlkem768Key, err := mlkem768DKey.Decapsulate(encryptedPfsPublicKey[:1088])
 	if err != nil {
 		return nil, err

@@ -137,7 +137,12 @@ func (m *Manager) RemoveHandler(ctx context.Context, tag string) error {
 
 	m.tagsCache = &sync.Map{}
 
-	delete(m.taggedHandler, tag)
+	if handler, found := m.taggedHandler[tag]; found {
+		if err := handler.Close(); err != nil {
+			errors.LogWarningInner(ctx, err, "failed to close handler ", tag)
+		}
+		delete(m.taggedHandler, tag)
+	}
 	if m.defaultHandler != nil && m.defaultHandler.Tag() == tag {
 		m.defaultHandler = nil
 	}
@@ -163,12 +168,15 @@ func (m *Manager) ListHandlers(ctx context.Context) []outbound.Handler {
 // Select implements outbound.HandlerSelector.
 func (m *Manager) Select(selectors []string) []string {
 	key := strings.Join(selectors, ",")
+
+	// tagsCache is replaced on every AddHandler/RemoveHandler, so it must be
+	// read under the same lock that guards the reassignment.
+	m.access.RLock()
+	defer m.access.RUnlock()
+
 	if cache, ok := m.tagsCache.Load(key); ok {
 		return cache.([]string)
 	}
-
-	m.access.RLock()
-	defer m.access.RUnlock()
 
 	tags := make([]string, 0, len(selectors))
 

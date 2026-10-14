@@ -195,7 +195,19 @@ func (s *DNS) Start() error {
 
 // Close implements common.Closable.
 func (s *DNS) Close() error {
-	return nil
+	var errs []error
+	for _, client := range s.clients {
+		if client.server == nil {
+			continue
+		}
+		if closer, ok := client.server.(common.Closable); ok {
+			if err := closer.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+
+	return errors.Combine(errs...)
 }
 
 // IsOwnLink implements proxy.dns.ownLinkVerifier
@@ -461,11 +473,22 @@ func asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx co
 
 		go func(i int, c *Client) {
 			qctx := ctx
-			if !c.server.IsDisableCache() {
-				nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.timeoutMs*2)
-				qctx = nctx
-				defer cancel()
+			var cancel context.CancelFunc
+			if c.server.IsDisableCache() {
+				// without a cached answer to fall back on there is no other
+				// bound on this query, it has to carry the timeout as well or
+				// parallelQuery would wait on <-resultsChan forever
+				if c.timeoutMs > 0 {
+					qctx, cancel = context.WithTimeout(ctx, c.timeoutMs)
+				}
+			} else {
+				qctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), c.timeoutMs*2)
 			}
+			defer func() {
+				if cancel != nil {
+					cancel()
+				}
+			}()
 			ips, ttl, err := c.QueryIP(qctx, domain, option)
 			ch <- queryResult{ips: ips, ttl: ttl, err: err, index: i}
 		}(i, client)

@@ -75,7 +75,25 @@ func ReadCert(file string) ([]byte, error) {
 	if filepath.IsAbs(file) {
 		return ReadFile(file)
 	}
-	return ReadFile(platform.GetCertLocation(file))
+	path, err := getCertFileLocation(file)
+	if err != nil {
+		return nil, err
+	}
+	return ReadFile(path)
+}
+
+// getCertFileLocation resolves a relative certificate path inside the
+// certificate directory. Like getAssetFileLocation it rejects paths that would
+// escape that directory.
+func getCertFileLocation(file string) (string, error) {
+	if !filepath.IsLocal(file) || file == "." {
+		return "", errors.New("certificate path must stay in the certificate directory")
+	}
+	local, err := filepath.Localize(file)
+	if err != nil {
+		return "", err
+	}
+	return platform.GetCertLocation(local), nil
 }
 
 func CopyFile(dst string, src string) error {

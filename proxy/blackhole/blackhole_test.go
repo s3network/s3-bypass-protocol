@@ -60,15 +60,20 @@ func TestBlackholeCustomResponse(t *testing.T) {
 	common.Must(err)
 
 	reader, writer := pipe.New(pipe.WithoutSizeLimit())
-	var actual buf.MultiBuffer
-	var rerr error
+	var (
+		actual   buf.MultiBuffer
+		readDone = make(chan struct{})
+	)
 	go func() {
-		actual, rerr = reader.ReadMultiBuffer()
+		defer close(readDone)
+		actual, _ = reader.ReadMultiBuffer()
 	}()
 
 	link := transport.Link{Reader: reader, Writer: writer}
 	common.Must(handler.Process(ctx, &link, nil))
-	common.Must(rerr)
+	// The reader goroutine writes actual, so wait for it before reading it
+	// back: a plain wait on the value would be a data race.
+	<-readDone
 
 	if actual.String() != string(expected) {
 		t.Errorf("custom response mismatch")
